@@ -1,0 +1,9 @@
+node_modules/
+.next/
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.idea/
+.vscode/
+README.md

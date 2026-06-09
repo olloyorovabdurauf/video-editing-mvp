@@ -1,0 +1,32 @@
+# Anything we don't need in the build context — keep image small and fast.
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local state — must NEVER be baked into the image.
+storage/
+test-storage/
+.env
+.env.local
+.env.*.local
+
+# Dev artifacts
+*.log
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Tests + benchmarks don't ship to prod.
+tests/
+eval/reports/
+
+# Docs that change often
+README.md
+PUBLISHING.md

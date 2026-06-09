@@ -1,0 +1,33 @@
+# Curated benchmark set. Add 10-20 items here as you encounter
+# real failure modes. Each item gets a frozen `golden_segments` list (chosen
+# by a human watching the source) — the eval scores the AI picks against it.
+#
+# Source URLs are intentionally a mix of:
+#   - Talking-head podcast (most common production use case)
+#   - Education / lecture (long-form to short-form conversion)
+#   - Interview (two speakers)
+#   - High-energy creator (TikTok-style, hard to improve on)
+#   - Low-energy explainer (where AI should add the most value)
+#
+# Use direct video URLs if YouTube extraction is flaky in your environment.
+
+items:
+  - id: podcast_01
+    label: "Talking head podcast — 30 min episode"
+    source_url: "https://example.com/podcast01.mp4"
+    target_count: 3
+    max_duration_s: 45
+    golden_segments:
+      # (start, end, why-this-clip)
+      - [127.5, 168.0, "contrarian take on remote work"]
+      - [412.0, 449.0, "memorable analogy about meetings"]
+      - [890.0, 921.0, "specific story with payoff"]
+
+  - id: lecture_01
+    label: "University CS lecture — 60 min"
+    source_url: "https://example.com/lecture01.mp4"
+    target_count: 5
+    max_duration_s: 60
+    golden_segments:
+      - [340.0, 395.0, "intuition for sorting complexity"]
+      - [1520.0, 1573.0, "the 'aha' moment about cache lines"]

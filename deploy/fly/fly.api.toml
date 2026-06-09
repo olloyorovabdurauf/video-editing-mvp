@@ -1,0 +1,45 @@
+# Fly.io config for the API + light I/O workers.
+# Deploy: `flyctl deploy -c deploy/fly/fly.api.toml --dockerfile backend/Dockerfile`
+
+app = "reelforge-api"          # change to your app name
+primary_region = "ord"          # pick the region closest to your users
+
+[build]
+  dockerfile = "backend/Dockerfile"
+
+# ---------------------------------------------------------------------------
+# Public HTTP service.
+# ---------------------------------------------------------------------------
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"   # idle → off (saves money)
+  auto_start_machines = true    # request → wake
+  min_machines_running = 1      # always one warm for fast cold-starts
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/api/v1/livez"
+
+# ---------------------------------------------------------------------------
+# Persistent volume — raw downloads + intermediate renders.
+# Final outputs MUST go to S3/R2 once you wire storage adapter (Task #6).
+# Until then this volume is the single point of failure.
+# ---------------------------------------------------------------------------
+[mounts]
+  source = "reelforge_storage"
+  destination = "/app/storage"
+  initial_size = "10gb"
+
+[[vm]]
+  size = "shared-cpu-2x"        # 2 vCPU, 2 GB RAM
+  memory = "2gb"
+
+[env]
+  APP_ENV = "production"
+  STORAGE_LOCAL_DIR = "/app/storage"
+  PYTHONUNBUFFERED = "1"
+  # Secrets via `flyctl secrets set` — never in this file.

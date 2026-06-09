@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node ---
+node_modules/
+.next/
+out/
+
+# --- Env / secrets ---
+.env
+.env.local
+.env.production
+.env.*.local
+!.env.example
+
+# --- Build artifacts / runtime state ---
+backend/storage/
+backend/test-storage/
+backend/eval/reports/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Logs ---
+*.log

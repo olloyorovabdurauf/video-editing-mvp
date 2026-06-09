@@ -1,0 +1,38 @@
+# Fly.io config for Celery workers — runs all queues in one process group
+# with concurrency tuned per queue. For scale beyond a few hundred jobs/day,
+# split into separate apps per queue and scale each independently.
+#
+# Deploy: `flyctl deploy -c deploy/fly/fly.worker.toml --dockerfile backend/Dockerfile`
+
+app = "reelforge-worker"
+primary_region = "ord"
+
+[build]
+  dockerfile = "backend/Dockerfile"
+
+# No public service — workers pull from Redis. No HTTP port exposed.
+[processes]
+  # `ffmpeg` queue gets concurrency=1 (each task pegs a CPU).
+  # `ai` queue gets concurrency=8 (mostly sleeping in HTTP polls).
+  # `io` queue gets concurrency=4 (downloads).
+  worker = "celery -A app.core.celery_app.celery_app worker -Q ffmpeg,ai,io -c 4 -l INFO"
+
+[mounts]
+  source = "reelforge_worker_storage"
+  destination = "/app/storage"
+  initial_size = "20gb"
+
+[[vm]]
+  size = "performance-2x"       # 2 vCPU, 4 GB RAM. ffmpeg likes RAM.
+  memory = "4gb"
+  processes = ["worker"]
+
+# Workers don't auto-stop — Celery needs to be alive to claim jobs.
+[deploy]
+  strategy = "rolling"          # one at a time, finish in-flight tasks
+  max_unavailable = 0.34
+
+[env]
+  APP_ENV = "production"
+  STORAGE_LOCAL_DIR = "/app/storage"
+  C_FORCE_ROOT = "1"            # Celery refuses to run as root by default; in container we're not root anyway
