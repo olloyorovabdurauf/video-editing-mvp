@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     runway_api_key: str = ""
     higgsfield_api_key: str = ""
 
+    # Kling 3.0 (primary provider — priority 5 in the chain).
+    # Kling auths with an AccessKey + SecretKey pair (JWT minted per request),
+    # not a single bearer token.
+    kling_access_key: str = ""
+    kling_secret_key: str = ""
+    kling_api_base: str = "https://api-singapore.klingai.com"
+    kling_model_name: str = "kling-v3-0"   # verify against current Kling docs
+    kling_mode: str = "std"                # std | pro (pro ≈ 2x cost, higher fidelity)
+
     # Hard upper bound on AI b-roll spend per job. Belt-and-suspenders next to
     # the per-job budget in the request payload.
     max_ai_broll_budget_usd: float = 8.0

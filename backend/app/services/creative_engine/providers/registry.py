@@ -34,6 +34,15 @@ def _build_chain() -> list[ProviderCandidate]:
     chain: list[ProviderCandidate] = []
     settings = get_settings()
 
+    if settings.kling_access_key and settings.kling_secret_key:
+        try:
+            from app.services.creative_engine.providers.kling import KlingProvider
+            # Priority 5: Kling 3.0 is our primary — native text2video (no
+            # reference image needed) and cheapest per clip.
+            chain.append(ProviderCandidate(KlingProvider(), priority=5))
+        except ProviderError as e:
+            logger.warning("kling disabled: {}", e)
+
     if settings.runway_api_key:
         try:
             from app.services.creative_engine.providers.runway import RunwayProvider

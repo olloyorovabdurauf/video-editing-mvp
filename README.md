@@ -73,10 +73,12 @@ docker compose up --build
 
 ## Provider fallback chain
 
-`Higgsfield (priority 10)` → `Runway (priority 20)` → `Pexels stock` → no b-roll
+`Kling 3.0 (priority 5)` → `Higgsfield (priority 10)` → `Runway (priority 20)` → `Pexels stock` → no b-roll
 
-Each provider self-disables if its API key isn't set. Cache hits short-circuit
-the whole submit/poll/download path.
+Kling 3.0 is the primary: native text-to-video (no reference image needed),
+cheapest per clip (~$0.35 std / ~$0.70 pro), 5s/10s at 9:16. Each provider
+self-disables if its API key isn't set. Cache hits short-circuit the whole
+submit/poll/download path.
 
 ## Repository layout
 
@@ -97,6 +99,7 @@ backend/app/
       cache.py              content-addressable Redis cache
       providers/
         base.py             VideoGenProvider ABC + GenerationJob
+        kling.py            Kling 3.0 — primary (JWT auth, native t2v)
         runway.py
         higgsfield.py
         registry.py         fallback chain + budget guard
@@ -118,8 +121,9 @@ frontend/
 
 - Whisper: ~$0.006/min of audio
 - GPT-4o segment picker: ~$0.02/job
-- Runway Gen-3 image-to-video: ~$0.50/clip × 5s
-- Higgsfield: ~$0.40/clip × up to 8s
+- Kling 3.0 text-to-video: ~$0.35/clip std, ~$0.70 pro × 5-10s (primary)
+- Runway Gen-3 image-to-video: ~$0.50/clip × 5s (fallback)
+- Higgsfield: ~$0.40/clip × up to 8s (fallback)
 
 A typical 3-reel job with 2 AI b-rolls per reel: **~$3-4 in inference**.
 Cache reduces repeat-prompt cost to zero. Set `ai_broll_budget_usd` per request
