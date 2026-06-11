@@ -7,11 +7,12 @@ plain Stripe Checkout redirect — we don't build a billing UI ourselves.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from loguru import logger
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.core.auth import require_user
 from app.services import billing
 
 router = APIRouter(prefix="/billing", tags=["billing"])
@@ -22,8 +23,10 @@ class BalanceResponse(BaseModel):
     balance: int
 
 
-@router.get("/balance/{user_id}", response_model=BalanceResponse)
-async def get_balance(user_id: str) -> BalanceResponse:
+@router.get("/balance", response_model=BalanceResponse)
+async def get_balance(user_id: str = Depends(require_user)) -> BalanceResponse:
+    """Caller's own balance. There is deliberately no /balance/{user_id} —
+    wallet balances are private; the token decides whose you see."""
     return BalanceResponse(user_id=user_id, balance=billing.get_balance(user_id))
 
 
@@ -62,7 +65,16 @@ async def stripe_webhook(
         raise HTTPException(500, "stripe SDK not installed")
 
     if not settings.stripe_webhook_secret:
-        # Soft-fail in dev: parse without verifying.
+        # FAIL CLOSED in production. An unverified webhook endpoint is a
+        # credit-minting machine: anyone can POST a fake
+        # checkout.session.completed and grant themselves credits.
+        if settings.is_prod:
+            logger.error("stripe webhook hit with no STRIPE_WEBHOOK_SECRET in prod — refusing")
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "webhook not configured",
+            )
+        # Soft-fail in dev only: parse without verifying.
         try:
             event = stripe.Event.construct_from(
                 stripe.util.json.loads(body), settings.stripe_api_key or "sk_dev"

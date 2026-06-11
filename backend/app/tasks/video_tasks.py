@@ -58,6 +58,14 @@ def get_job(job_id: str) -> ReelJobResponse | None:
     return ReelJobResponse(**json.loads(raw))
 
 
+def get_job_owner(job_id: str) -> str | None:
+    """Owner user_id for authorization checks. None if job unknown."""
+    raw = r.get(_key(job_id))
+    if not raw:
+        return None
+    return json.loads(raw).get("user_id")
+
+
 # ---------------------------------------------------------------------------
 # Failure handler — refunds the credit hold if any stage of the chain dies
 # ---------------------------------------------------------------------------
@@ -364,12 +372,11 @@ def enqueue_reel_job(req: ReelCreateRequest) -> str:
         use_ai_broll=req.use_ai_broll,
         use_smart_crop=req.smart_crop,
     )
+    # InsufficientCredits propagates to the API layer, which maps it to 402.
+    # Don't wrap it — erasing the type forces callers to parse strings.
     hold_id = ""
     if req.user_id != "anonymous":
-        try:
-            hold_id = billing.hold(req.user_id, estimated, job_id=job_id)
-        except billing.InsufficientCredits as e:
-            raise ValueError(f"credits: {e}") from e
+        hold_id = billing.hold(req.user_id, estimated, job_id=job_id)
 
     _update(
         job_id,

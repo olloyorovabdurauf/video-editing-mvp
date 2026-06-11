@@ -19,10 +19,9 @@ import hashlib
 import json
 import re
 import shlex
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, Callable, Iterable, Sequence
+from typing import Callable, Sequence
 
 from loguru import logger
 

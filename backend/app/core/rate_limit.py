@@ -61,9 +61,18 @@ def rate_limit(scope: str, *, max_per_window: int, window_s: int):
     that's a separate ProxyHeadersMiddleware concern.
     """
     async def dep(request: Request) -> None:
-        identity = request.headers.get("X-User-Id") or (
-            request.client.host if request.client else "anon"
-        )
+        # Identity for the bucket. In prod we NEVER trust X-User-Id — it's a
+        # client-controlled header, and trusting it means rotating one header
+        # value resets your limit. IP is coarse but unforgeable (we run behind
+        # uvicorn --proxy-headers, so client.host is the real peer).
+        # Dev keeps the header for convenient per-user testing.
+        settings = get_settings()
+        if settings.is_prod:
+            identity = request.client.host if request.client else "anon"
+        else:
+            identity = request.headers.get("X-User-Id") or (
+                request.client.host if request.client else "anon"
+            )
         allowed, count = _check(scope, identity, max_per_window=max_per_window, window_s=window_s)
         if not allowed:
             raise HTTPException(
