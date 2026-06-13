@@ -133,23 +133,63 @@ def _looks_like_direct_media(url: str) -> bool:
     return urlparse(url).path.lower().endswith(_DIRECT_MEDIA_EXTS)
 
 
+# Header strategies tried in order. Different hosts block different things:
+#   - Wikimedia/w3.org 403 a bare Chrome UA (incomplete browser fingerprint)
+#     but accept curl-like or fully-formed browser requests.
+#   - Some hosts 403 non-browser UAs.
+# A real human's first paste shouldn't fail on a recoverable 403, so we fall
+# back across strategies and take the first 2xx.
+_HEADER_STRATEGIES: tuple[dict[str, str], ...] = (
+    {   # 1. Fully-formed browser fingerprint (passes most WAFs)
+        "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,video/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
+    },
+    {"User-Agent": "curl/8.7.1", "Accept": "*/*"},                  # 2. curl-like
+    {"User-Agent": "ReelForge/1.0 (+https://reelforge.app)"},       # 3. honest bot
+)
+
+_BLOCKED_STATUSES = frozenset({401, 403, 429})
+
+
 def _download_direct(url: str, dst: Path) -> Path:
-    """Stream a direct media file over HTTP with a browser UA + bounded timeouts."""
+    """
+    Stream a direct media file over HTTP, trying multiple header strategies so
+    a recoverable 401/403/429 on one fingerprint falls back to the next.
+    Bounded timeouts mean a stalled host can never hang the worker.
+    """
     import httpx
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     timeout = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
-    with httpx.stream(
-        "GET", url,
-        follow_redirects=True,
-        timeout=timeout,
-        headers={"User-Agent": _BROWSER_UA, "Accept": "*/*"},
-    ) as resp:
-        resp.raise_for_status()
-        with dst.open("wb") as f:
-            for chunk in resp.iter_bytes(chunk_size=1 << 16):
-                f.write(chunk)
-    return dst
+    last_status: int | None = None
+
+    for headers in _HEADER_STRATEGIES:
+        try:
+            with httpx.stream(
+                "GET", url, follow_redirects=True, timeout=timeout, headers=headers,
+            ) as resp:
+                if resp.status_code in _BLOCKED_STATUSES:
+                    last_status = resp.status_code
+                    continue  # try the next strategy
+                resp.raise_for_status()
+                with dst.open("wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=1 << 16):
+                        f.write(chunk)
+                return dst
+        except httpx.HTTPStatusError as e:
+            last_status = e.response.status_code
+            if e.response.status_code in _BLOCKED_STATUSES:
+                continue
+            raise
+
+    raise RuntimeError(
+        f"all download strategies blocked (last HTTP {last_status}) for {url} — "
+        "the host is rejecting automated requests"
+    )
 
 
 def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
