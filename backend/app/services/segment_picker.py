@@ -59,6 +59,22 @@ Return JSON:
 }}
 """
 
+# Used only when the strict pass finds nothing. A clipping tool should never
+# hand the user an empty result — return the best available moment and let
+# them judge. Scores will be honest (low), the duration floor is relaxed so
+# short source videos still yield a clip.
+LENIENT_SYSTEM_PROMPT = """\
+You are a short-form video editor. The strict viral pass found nothing.
+Return the SINGLE most engaging moment from this transcript anyway — even if
+it is not classically viral. You MUST return exactly one segment.
+
+Rules:
+- Duration between 6 and {max_dur} seconds (or the whole clip if shorter).
+- Start and end on natural sentence boundaries where possible.
+- hook_score should be an honest 0..0.6 reflecting the (limited) appeal.
+- Return STRICT JSON, same shape as requested.
+"""
+
 
 def _compress(transcript: Transcript, window_s: float = 4.0) -> str:
     """Bucket word-level timestamps into ~4s lines to keep tokens down."""
@@ -103,9 +119,41 @@ async def pick_segments(
         ],
     )
     data: dict[str, Any] = json.loads(resp.choices[0].message.content or "{}")
-    raw = data.get("segments", [])
+    out = _clamp(data.get("segments", []), max_duration_s, min_dur=5.0)
+    out.sort(key=lambda x: x.hook_score, reverse=True)
+    if out:
+        return out[:n]
 
-    # Validate + clamp
+    # --- Fallback 1: nothing met the strict bar. Ask for the best available. ---
+    logger.info("strict pass returned 0 segments; running lenient fallback")
+    try:
+        resp2 = await client.chat.completions.create(
+            model=settings.openai_reasoning_model,
+            response_format={"type": "json_object"},
+            temperature=0.5,
+            messages=[
+                {"role": "system", "content": LENIENT_SYSTEM_PROMPT.format(max_dur=max_duration_s)},
+                {"role": "user",   "content": USER_TEMPLATE.format(
+                    prompt=prompt or "(none)", lines=compressed
+                )},
+            ],
+        )
+        data2 = json.loads(resp2.choices[0].message.content or "{}")
+        out = _clamp(data2.get("segments", []), max_duration_s, min_dur=4.0)
+        out.sort(key=lambda x: x.hook_score, reverse=True)
+        if out:
+            return out[:n]
+    except Exception as e:
+        logger.warning("lenient fallback failed: {}", e)
+
+    # --- Fallback 2: synthesize from the transcript bounds (deterministic). ---
+    # Guarantees a clipping tool never returns nothing for a video with speech.
+    synth = _synthesize_from_transcript(transcript, max_duration_s)
+    return [synth] if synth else []
+
+
+def _clamp(raw: list, max_duration_s: int, *, min_dur: float) -> list[Segment]:
+    """Validate raw LLM segments into Segments within duration bounds."""
     out: list[Segment] = []
     for s in raw:
         try:
@@ -113,8 +161,28 @@ async def pick_segments(
         except Exception as e:
             logger.warning("dropping malformed segment {}: {}", s, e)
             continue
-        if seg.end - seg.start < 5 or seg.end - seg.start > max_duration_s + 5:
+        if seg.end - seg.start < min_dur or seg.end - seg.start > max_duration_s + 5:
             continue
         out.append(seg)
-    out.sort(key=lambda x: x.hook_score, reverse=True)
-    return out[:n]
+    return out
+
+
+def _synthesize_from_transcript(transcript: Transcript, max_duration_s: int) -> Segment | None:
+    """
+    Last-resort clip: cover the speech from its start up to max_duration_s.
+    Honest low hook_score; the text is the verbatim words in the window.
+    """
+    if not transcript.words:
+        return None
+    start = transcript.words[0].start
+    end = min(start + max_duration_s, transcript.words[-1].end)
+    if end - start < 3:
+        end = transcript.words[-1].end
+    text = " ".join(w.text for w in transcript.words if start <= w.start <= end)
+    return Segment(
+        start=round(start, 2),
+        end=round(end, 2),
+        hook_score=0.3,
+        reason="Best available moment (no strongly viral hook detected).",
+        transcript=text[:500],
+    )
