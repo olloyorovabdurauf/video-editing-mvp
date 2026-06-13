@@ -193,6 +193,11 @@ def _download_direct(url: str, dst: Path) -> Path:
 
 
 def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
+    # NOTE: we deliberately do NOT force a global User-Agent here. yt-dlp
+    # emulates several YouTube clients (android/ios/web), each with its own UA;
+    # overriding it breaks that emulation and re-triggers bot-detection. Let
+    # yt-dlp manage headers per client. Keeping yt-dlp itself current (see
+    # requirements.txt) is what actually keeps YouTube working.
     ydl_opts = {
         "outtmpl": out_tmpl,
         # Trailing "/b" so a single progressive stream still satisfies the selector.
@@ -202,7 +207,7 @@ def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
         "noprogress": True,
         "socket_timeout": 30,       # never hang forever on a stalled host
         "retries": 3,
-        "http_headers": {"User-Agent": _BROWSER_UA},
+        "concurrent_fragment_downloads": 4,   # faster DASH fetches
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)

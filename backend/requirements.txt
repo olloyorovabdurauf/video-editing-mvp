@@ -17,7 +17,11 @@ tenacity==9.0.0              # Retries with backoff
 
 # --- Media / utility ---
 ffmpeg-python==0.2.0         # Optional: we mostly call ffmpeg directly
-yt-dlp==2024.9.27            # Download YouTube/arbitrary URLs
+# yt-dlp tracks YouTube's ever-changing extraction. A stale pin = "Sign in to
+# confirm you're not a bot" / "no formats" failures. KEEP THIS CURRENT — bump
+# at least monthly (Dependabot/Renovate recommended). 2024.09.27 was 9 months
+# stale and could not extract YouTube at all from a datacenter IP.
+yt-dlp==2026.6.9             # Download YouTube/arbitrary URLs
 python-slugify==8.0.4
 loguru==0.7.2
 
