@@ -81,11 +81,17 @@ def _on_task_failure(sender=None, task_id=None, exception=None, **kw):
     # it from the AsyncResult if possible. Best-effort — production should
     # link this via task chord callback for stricter semantics.
     try:
-        args = (kw.get("args") or [None])
-        ctx = args[0] if isinstance(args[0], dict) else None
-        if not ctx or "job_id" not in ctx:
+        args = kw.get("args") or []
+        # Chained tasks (transcribe/analyze/render) carry a ctx dict as arg0;
+        # t_download carries the job_id string as arg0. Handle both.
+        job_id = None
+        if args:
+            if isinstance(args[0], dict):
+                job_id = args[0].get("job_id")
+            elif isinstance(args[0], str):
+                job_id = args[0]
+        if not job_id:
             return
-        job_id = ctx["job_id"]
         state = json.loads(r.get(_key(job_id)) or "{}")
         from app.services import billing as _billing
         if state.get("credit_hold_id") and state.get("user_id") not in (None, "anonymous"):
@@ -103,6 +109,67 @@ def _run(coro):
 
 
 # ---------------------------------------------------------------------------
+# Source download helpers
+#
+# Two distinct paths, because they have different failure modes:
+#   - Direct media file URL (…/clip.mp4) → plain HTTP stream. yt-dlp's generic
+#     extractor sends a non-browser User-Agent that many CDNs (w3.org, GCS,
+#     etc.) answer with 403, so we must NOT route direct files through it.
+#   - Platform URL (YouTube/Vimeo/…) → yt-dlp, but hardened with a socket
+#     timeout, retry cap, and a browser UA so a stalled host can't hang a
+#     worker forever.
+# ---------------------------------------------------------------------------
+
+from urllib.parse import urlparse  # noqa: E402
+
+_DIRECT_MEDIA_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".m4a", ".mp3", ".wav")
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _looks_like_direct_media(url: str) -> bool:
+    return urlparse(url).path.lower().endswith(_DIRECT_MEDIA_EXTS)
+
+
+def _download_direct(url: str, dst: Path) -> Path:
+    """Stream a direct media file over HTTP with a browser UA + bounded timeouts."""
+    import httpx
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    timeout = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
+    with httpx.stream(
+        "GET", url,
+        follow_redirects=True,
+        timeout=timeout,
+        headers={"User-Agent": _BROWSER_UA, "Accept": "*/*"},
+    ) as resp:
+        resp.raise_for_status()
+        with dst.open("wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=1 << 16):
+                f.write(chunk)
+    return dst
+
+
+def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
+    ydl_opts = {
+        "outtmpl": out_tmpl,
+        # Trailing "/b" so a single progressive stream still satisfies the selector.
+        "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "noprogress": True,
+        "socket_timeout": 30,       # never hang forever on a stalled host
+        "retries": 3,
+        "http_headers": {"User-Agent": _BROWSER_UA},
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+
+
+# ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
@@ -113,21 +180,24 @@ def t_download(self, job_id: str, payload: dict) -> dict:
 
     work = settings.storage_local_dir / "raw" / job_id
     work.mkdir(parents=True, exist_ok=True)
-    out_tmpl = str(work / "source.%(ext)s")
+    url = str(req.source_url)
 
-    ydl_opts = {
-        "outtmpl": out_tmpl,
-        "format": "bv*[height<=1080]+ba/b[height<=1080]",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "noprogress": True,
-    }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(str(req.source_url), download=True)
-            src = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+        if _looks_like_direct_media(url):
+            src = _download_direct(url, work / "source.mp4")
+        else:
+            src = _download_via_ytdlp(url, str(work / "source.%(ext)s"))
+        if not src.exists() or src.stat().st_size == 0:
+            raise RuntimeError("download produced no file")
     except Exception as e:
-        logger.exception("download failed")
+        logger.exception("download failed for job {}", job_id)
+        # On the final retry, mark the job FAILED so it never hangs in
+        # "downloading" (the chain stops here — there's no ctx for the
+        # failure signal to recover from on this first task).
+        if self.request.retries >= self.max_retries:
+            _update(job_id, status=ReelJobStatus.FAILED.value,
+                    message=f"download failed: {type(e).__name__}: {e}")
+            raise
         raise self.retry(exc=e, countdown=5)
 
     return {"job_id": job_id, "payload": payload, "source_path": str(src)}
@@ -372,10 +442,12 @@ def enqueue_reel_job(req: ReelCreateRequest) -> str:
         use_ai_broll=req.use_ai_broll,
         use_smart_crop=req.smart_crop,
     )
-    # InsufficientCredits propagates to the API layer, which maps it to 402.
-    # Don't wrap it — erasing the type forces callers to parse strings.
+    # Only reserve credits when billing is actually enabled. With
+    # REQUIRE_CREDITS=false (dev / free beta) nobody is charged, even
+    # authenticated users. InsufficientCredits propagates to the API layer,
+    # which maps it to 402 — don't wrap it (erasing the type forces string parsing).
     hold_id = ""
-    if req.user_id != "anonymous":
+    if settings.require_credits and req.user_id != "anonymous":
         hold_id = billing.hold(req.user_id, estimated, job_id=job_id)
 
     _update(

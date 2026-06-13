@@ -1,0 +1,56 @@
+# SMOKE-TEST / MVP manifest — single machine runs BOTH the API (uvicorn) and a
+# Celery worker, sharing ONE volume so local storage works end-to-end without
+# needing R2. This is the right shape for an early MVP at low volume; split into
+# separate api/worker apps + R2 (fly.api.toml / fly.worker.toml) when you scale.
+#
+# Deploy: flyctl deploy -c deploy/fly/fly.mvp.toml --remote-only
+#
+# NOTE: APP_ENV=development is deliberate for the private smoke test — it keeps
+# auth permissive (X-User-Id / anonymous) and CORS open so we can curl the API
+# directly. Flip to production + Clerk + locked CORS before real users.
+
+app = "reelforge-mvp-x7k2"
+primary_region = "fra"          # close to the user (Central Asia → Frankfurt)
+
+# Dockerfile + build context are passed on the CLI (--dockerfile + positional
+# working dir = backend/) so COPY paths resolve correctly. Keeping [build] out
+# of this file avoids flyctl resolving the path relative to the config dir.
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "suspend"   # idle → suspend (fast resume, saves money)
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]              # bind the public service to the "app" process
+
+  [[http_service.checks]]
+    grace_period = "40s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/api/v1/livez"
+
+# One process running both services. tini (Dockerfile ENTRYPOINT) reaps both.
+# Celery in the background, uvicorn in the foreground.
+[processes]
+  app = "sh -c 'celery -A app.core.celery_app.celery_app worker -Q ffmpeg,ai,io -c 2 -l INFO & exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*'"
+
+[mounts]
+  source = "reelforge_data"
+  destination = "/app/storage"
+  initial_size = "10gb"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "4gb"                 # ffmpeg + whisper audio + celery + uvicorn share this
+  processes = ["app"]
+
+[env]
+  APP_ENV = "development"        # smoke-test only — see header note
+  STORAGE_BACKEND = "local"
+  STORAGE_LOCAL_DIR = "/app/storage"
+  AUTH_MODE = "none"
+  REQUIRE_CREDITS = "false"
+  PYTHONUNBUFFERED = "1"
+  # OPENAI_API_KEY, REDIS_URL, CELERY_* → flyctl secrets set (never in this file)
