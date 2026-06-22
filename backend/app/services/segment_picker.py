@@ -45,15 +45,16 @@ User directive (may be empty): {prompt}
 Transcript (each line = "[start-end] text"):
 {lines}
 
-Return JSON:
+Return JSON. Do NOT echo the transcript text — only timestamps + a short
+reason. (We reconstruct the verbatim text ourselves from the timestamps; this
+keeps the response small so it never truncates on long videos.)
 {{
   "segments": [
     {{
       "start": <float>,
       "end":   <float>,
       "hook_score": <float 0..1>,
-      "reason": "<one sentence on why this hooks>",
-      "transcript": "<verbatim text inside the window>"
+      "reason": "<one short sentence on why this hooks>"
     }}
   ]
 }}
@@ -111,6 +112,7 @@ async def pick_segments(
         model=settings.openai_reasoning_model,
         response_format={"type": "json_object"},
         temperature=0.4,
+        max_tokens=1500,            # ample for N segments without transcripts
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT.format(n=n, max_dur=max_duration_s)},
             {"role": "user",   "content": USER_TEMPLATE.format(
@@ -118,8 +120,7 @@ async def pick_segments(
             )},
         ],
     )
-    data: dict[str, Any] = json.loads(resp.choices[0].message.content or "{}")
-    out = _clamp(data.get("segments", []), max_duration_s, min_dur=5.0)
+    out = _clamp(_safe_segments(resp), transcript, max_duration_s, min_dur=5.0)
     out.sort(key=lambda x: x.hook_score, reverse=True)
     if out:
         return out[:n]
@@ -131,6 +132,7 @@ async def pick_segments(
             model=settings.openai_reasoning_model,
             response_format={"type": "json_object"},
             temperature=0.5,
+            max_tokens=600,
             messages=[
                 {"role": "system", "content": LENIENT_SYSTEM_PROMPT.format(max_dur=max_duration_s)},
                 {"role": "user",   "content": USER_TEMPLATE.format(
@@ -138,8 +140,7 @@ async def pick_segments(
                 )},
             ],
         )
-        data2 = json.loads(resp2.choices[0].message.content or "{}")
-        out = _clamp(data2.get("segments", []), max_duration_s, min_dur=4.0)
+        out = _clamp(_safe_segments(resp2), transcript, max_duration_s, min_dur=4.0)
         out.sort(key=lambda x: x.hook_score, reverse=True)
         if out:
             return out[:n]
@@ -152,13 +153,43 @@ async def pick_segments(
     return [synth] if synth else []
 
 
-def _clamp(raw: list, max_duration_s: int, *, min_dur: float) -> list[Segment]:
-    """Validate raw LLM segments into Segments within duration bounds."""
+def _safe_segments(resp: Any) -> list[dict]:
+    """
+    Parse the model's JSON content defensively. response_format=json_object
+    *usually* yields valid JSON, but a truncated/odd response shouldn't crash
+    the whole job — return [] and let the fallback chain handle it.
+    """
+    content = (resp.choices[0].message.content or "").strip()
+    try:
+        return json.loads(content).get("segments", [])
+    except (json.JSONDecodeError, AttributeError) as e:
+        logger.warning("segment JSON parse failed ({}); first 120 chars: {!r}",
+                       e, content[:120])
+        return []
+
+
+def _text_in_window(transcript: Transcript, start: float, end: float) -> str:
+    """Verbatim transcript text inside [start, end] — sliced from our own
+    word timestamps, so it's accurate and never bloats the LLM response."""
+    return " ".join(w.text for w in transcript.words if start <= w.start <= end)[:500]
+
+
+def _clamp(raw: list, transcript: Transcript, max_duration_s: int, *, min_dur: float) -> list[Segment]:
+    """Validate raw LLM picks (start/end/hook_score/reason) into Segments,
+    filling transcript text ourselves from word timestamps."""
     out: list[Segment] = []
-    for s in raw:
+    for s in raw or []:
+        if not isinstance(s, dict):
+            continue
         try:
-            seg = Segment(**s)
-        except Exception as e:
+            start = float(s["start"]); end = float(s["end"])
+            seg = Segment(
+                start=start, end=end,
+                hook_score=float(s.get("hook_score", 0.5)),
+                reason=str(s.get("reason", ""))[:300],
+                transcript=_text_in_window(transcript, start, end),
+            )
+        except (KeyError, ValueError, TypeError) as e:
             logger.warning("dropping malformed segment {}: {}", s, e)
             continue
         if seg.end - seg.start < min_dur or seg.end - seg.start > max_duration_s + 5:

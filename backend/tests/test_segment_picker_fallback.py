@@ -26,20 +26,37 @@ def _transcript(words: list[tuple[str, float, float]]) -> Transcript:
 # ---------------------------------------------------------------------------
 
 def test_clamp_drops_too_short_and_too_long():
+    # LLM now returns only start/end/hook_score/reason (no transcript).
     raw = [
-        {"start": 0, "end": 2, "hook_score": 0.9, "reason": "r", "transcript": "t"},   # 2s < min
-        {"start": 0, "end": 30, "hook_score": 0.8, "reason": "r", "transcript": "t"},  # ok (max 25+5)
-        {"start": 0, "end": 60, "hook_score": 0.8, "reason": "r", "transcript": "t"},  # 60s > 25+5
+        {"start": 0, "end": 2, "hook_score": 0.9, "reason": "r"},   # 2s < min
+        {"start": 0, "end": 30, "hook_score": 0.8, "reason": "r"},  # ok (max 25+5)
+        {"start": 0, "end": 60, "hook_score": 0.8, "reason": "r"},  # 60s > 25+5
     ]
-    out = sp._clamp(raw, max_duration_s=25, min_dur=5.0)
+    t = _transcript([("hello", 1.0, 1.5), ("world", 10.0, 10.4)])
+    out = sp._clamp(raw, t, max_duration_s=25, min_dur=5.0)
     assert len(out) == 1
     assert out[0].end == 30
+    # transcript text is filled from our own words, not the LLM
+    assert "hello" in out[0].transcript
 
 
 def test_clamp_relaxed_min_keeps_short_clip():
-    raw = [{"start": 0, "end": 4.5, "hook_score": 0.4, "reason": "r", "transcript": "t"}]
-    assert len(sp._clamp(raw, 25, min_dur=4.0)) == 1   # kept at min_dur=4
-    assert len(sp._clamp(raw, 25, min_dur=5.0)) == 0   # dropped at min_dur=5
+    raw = [{"start": 0, "end": 4.5, "hook_score": 0.4, "reason": "r"}]
+    t = _transcript([("a", 1.0, 1.2)])
+    assert len(sp._clamp(raw, t, 25, min_dur=4.0)) == 1   # kept at min_dur=4
+    assert len(sp._clamp(raw, t, 25, min_dur=5.0)) == 0   # dropped at min_dur=5
+
+
+def test_clamp_survives_missing_fields():
+    """A truncated/odd LLM pick must be dropped, not crash."""
+    t = _transcript([("x", 1.0, 1.2)])
+    raw = [
+        {"start": 0},                                    # missing end → dropped
+        {"hook_score": 0.5},                             # missing start/end → dropped
+        {"start": 0, "end": 20, "hook_score": 0.7, "reason": "ok"},  # valid
+    ]
+    out = sp._clamp(raw, t, 30, min_dur=5.0)
+    assert len(out) == 1 and out[0].end == 20
 
 
 # ---------------------------------------------------------------------------
@@ -113,4 +130,22 @@ async def test_synthesis_when_both_llm_passes_empty():
         oai.return_value.chat.completions.create = AsyncMock(side_effect=[empty, empty])
         out = await sp.pick_segments(t, n=1, max_duration_s=20, prompt=None)
     assert len(out) == 1
+    assert out[0].reason.startswith("Best available")
+
+
+@pytest.mark.asyncio
+async def test_truncated_json_does_not_crash():
+    """The long-video bug: a response truncated mid-string must NOT crash
+    analyze. _safe_segments returns [] → fallback chain → synthesis."""
+    t = _transcript([("here", 1.0, 1.4), ("we", 1.5, 1.7), ("go", 1.8, 2.2)])
+    truncated = MagicMock()
+    truncated.choices = [MagicMock()]
+    # Unterminated string — exactly the failure seen on the 15-min YouTube talk.
+    truncated.choices[0].message.content = (
+        '{"segments": [{"start": 1, "end": 18, "reason": "an unterminated'
+    )
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        oai.return_value.chat.completions.create = AsyncMock(side_effect=[truncated, truncated])
+        out = await sp.pick_segments(t, n=1, max_duration_s=20, prompt=None)
+    assert len(out) == 1                      # never zero, never crashes
     assert out[0].reason.startswith("Best available")
