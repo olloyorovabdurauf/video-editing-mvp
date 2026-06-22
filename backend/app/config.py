@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     # 120 min ≈ $0.72 of Whisper at most. Raise once you have paying users.
     max_source_minutes: int = 120
 
+    # YouTube blocks data downloads from datacenter IPs after repeated use.
+    # Set this to a residential/rotating proxy (e.g. http://user:pass@host:port)
+    # for reliable YouTube downloads at scale. Empty = direct (works for direct
+    # media URLs and intermittently for YouTube from a fresh IP).
+    ytdlp_proxy: str = ""
+
     # Stock footage
     pexels_api_key: str = ""
     pixabay_api_key: str = ""

@@ -206,9 +206,15 @@ def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
         "quiet": True,
         "noprogress": True,
         "socket_timeout": 30,       # never hang forever on a stalled host
-        "retries": 3,
+        "retries": 5,
+        "extractor_retries": 3,
+        "fragment_retries": 10,     # ride out transient 4xx on individual fragments
         "concurrent_fragment_downloads": 4,   # faster DASH fetches
     }
+    # Route through a residential proxy when configured. This is what makes
+    # YouTube reliable at scale — datacenter IPs get 403'd on data fetches.
+    if settings.ytdlp_proxy:
+        ydl_opts["proxy"] = settings.ytdlp_proxy
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
