@@ -47,12 +47,17 @@ async def create_reel(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(e),
                             headers={"Retry-After": "3600"})
 
-    # SSRF guard: we fetch this URL server-side; refuse anything that
-    # resolves to internal/private address space.
-    try:
-        validate_source_url(str(req.source_url))
-    except UnsafeURLError as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"source_url rejected: {e}")
+    # SSRF guard applies only to user-supplied URLs we fetch server-side.
+    # Uploads come from our own private R2 bucket (no SSRF surface), and the
+    # key must belong to this user (no reading another account's upload).
+    if req.is_upload:
+        if not req.upload_key.startswith(f"uploads/{user_id}/"):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "upload_key does not belong to you")
+    else:
+        try:
+            validate_source_url(str(req.source_url))
+        except UnsafeURLError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"source_url rejected: {e}")
 
     try:
         job_id = enqueue_reel_job(req)

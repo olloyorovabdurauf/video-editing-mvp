@@ -130,10 +130,12 @@ def t_download(self, job_id: str, payload: dict) -> dict:
 
     work = settings.storage_local_dir / "raw" / job_id
     work.mkdir(parents=True, exist_ok=True)
-    url = str(req.source_url)
 
     try:
-        src = ingestion.download_source(url, work)
+        if req.is_upload:
+            src = ingestion.fetch_upload(req.upload_key, work)
+        else:
+            src = ingestion.download_source(str(req.source_url), work)
     except ingestion.IngestionError as e:
         logger.warning("ingestion failed for job {}: {}", job_id, e)
         # Retry transient blocks (403/429/timeout); fail permanent ones (private,
@@ -389,6 +391,18 @@ def t_render(self, ctx: dict) -> dict:
         processing_time_s=proc_s,
         audio_minutes=ctx.get("audio_minutes", 0.0),
     )
+    # Durable history (no-op until DATABASE_URL is set). Never let a DB hiccup
+    # fail a job that already succeeded — the reels are rendered and served.
+    try:
+        from app.db import repositories
+        repositories.record_completed_job(
+            job_id=ctx["job_id"], user_id=prior.get("user_id", "anonymous"),
+            status="completed", cost_usd=cost, processing_time_s=proc_s,
+            clips=len(artifacts), audio_minutes=float(ctx.get("audio_minutes", 0.0)),
+        )
+    except Exception as e:
+        logger.warning("durable job record skipped: {}", e)
+
     logger.info("job {} done: {} reels, ${} cost, {}s", ctx["job_id"], len(artifacts), cost, proc_s)
     return {"job_id": ctx["job_id"], "ok": True}
 

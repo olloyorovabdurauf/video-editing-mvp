@@ -35,6 +35,9 @@ class StorageBackend(Protocol):
     def presigned_download(self, key: str, *, expires_s: int = 3600) -> str:
         """Time-limited GET URL for a private object."""
 
+    def download_to(self, key: str, dst: Path) -> Path:
+        """Fetch object `key` into local `dst` (worker pulling an upload)."""
+
     def delete(self, key: str) -> None:
         ...
 
@@ -64,6 +67,11 @@ class LocalStorage:
 
     def presigned_download(self, key: str, *, expires_s: int = 3600) -> str:
         return f"/storage/{key}"
+
+    def download_to(self, key: str, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.root / key, dst)
+        return dst
 
     def delete(self, key: str) -> None:
         (self.root / key).unlink(missing_ok=True)
@@ -132,6 +140,11 @@ class S3Storage:
         return self.client.generate_presigned_url(
             "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires_s,
         )
+
+    def download_to(self, key: str, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        self.client.download_file(self.bucket, key, str(dst))
+        return dst
 
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=key)

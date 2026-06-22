@@ -17,6 +17,8 @@ async def lifespan(app: FastAPI):
     # Sentry first so any error during the rest of bootstrapping gets reported.
     from app.core.observability import init_sentry
     init_sentry()
+    from app.db.session import init_engine
+    init_engine()                      # no-op unless DATABASE_URL is set
     settings = get_settings()
     settings.storage_local_dir.mkdir(parents=True, exist_ok=True)
     yield

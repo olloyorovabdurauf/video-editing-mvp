@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     # Observability
     sentry_dsn: str = ""                          # empty = no-op
 
+    # Database (durable records). Empty = Redis-only mode (DB layer disabled).
+    # Set to a Neon Postgres URL to enable users/jobs/usage/ledger persistence.
+    database_url: str = ""
+
     # Storage
     storage_backend: str = "local"
     storage_local_dir: Path = Field(default=Path("./storage"))

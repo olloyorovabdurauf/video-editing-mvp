@@ -31,6 +31,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+# Auto-incrementing 64-bit PK that also works on SQLite (which only
+# auto-increments INTEGER PRIMARY KEY). BigInteger on Postgres, Integer on SQLite.
+AutoBigInt = BigInteger().with_variant(Integer, "sqlite")
+
 
 def _uuid() -> str:
     return uuid.uuid4().hex
@@ -175,6 +179,26 @@ class ProcessingJob(Base):
     __table_args__ = (Index("ix_jobs_user_created", "user_id", "created_at"),)
 
 
+class LedgerEntry(Base):
+    """
+    Append-only credit ledger — the source of truth for money. Balance is the
+    sum of `delta` for a user. Never UPDATE or DELETE rows; corrections are new
+    rows. `idempotency_key` makes every operation safe to retry (Stripe webhook
+    redelivery, Celery task retry) without double-applying.
+    """
+    __tablename__ = "ledger_entries"
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    delta: Mapped[int] = mapped_column(Integer)               # +credit / -hold / +refund / settle adj.
+    kind: Mapped[str] = mapped_column(String(16))             # credit|hold|settle|refund
+    ref: Mapped[str | None] = mapped_column(String(128))      # job_id or stripe session id
+    idempotency_key: Mapped[str | None] = mapped_column(String(160), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_ledger_user", "user_id"),)
+
+
 class UsageCounter(Base):
     """
     Per-user, per-period rollup for quotas + billing analytics. One row per
@@ -183,7 +207,7 @@ class UsageCounter(Base):
     """
     __tablename__ = "usage_counters"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     period: Mapped[str] = mapped_column(String(6))          # YYYYMM
     jobs_count: Mapped[int] = mapped_column(Integer, default=0)

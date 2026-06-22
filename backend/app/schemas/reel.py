@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 
 class AspectRatio(str, Enum):
@@ -25,9 +25,17 @@ CaptionStyle = Literal["karaoke", "popup", "minimal", "none"]
 
 
 class ReelCreateRequest(BaseModel):
-    """Input the client posts to /api/v1/reels."""
+    """Input the client posts to /api/v1/reels.
 
-    source_url: HttpUrl = Field(..., description="YouTube link or any direct video URL")
+    Exactly one source must be given:
+      - source_url: a YouTube link or direct video URL (we fetch it), or
+      - upload_key: the R2 key returned by POST /uploads (user-uploaded file).
+    """
+
+    source_url: HttpUrl | None = Field(
+        None, description="YouTube link or any direct video URL")
+    upload_key: str | None = Field(
+        None, max_length=512, description="R2 key from POST /uploads for an uploaded file")
     aspect: AspectRatio = AspectRatio.VERTICAL
     target_count: int = Field(3, ge=1, le=10, description="How many reels to extract")
     max_duration_s: int = Field(60, ge=10, le=180)
@@ -61,6 +69,16 @@ class ReelCreateRequest(BaseModel):
     # Identity — for credit accounting. In dev we accept anonymous; prod
     # should require an authenticated user via the auth dep.
     user_id: str = Field("anonymous", description="Owner; debited for credit usage")
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "ReelCreateRequest":
+        if bool(self.source_url) == bool(self.upload_key):
+            raise ValueError("provide exactly one of source_url or upload_key")
+        return self
+
+    @property
+    def is_upload(self) -> bool:
+        return self.upload_key is not None
 
 
 class Segment(BaseModel):

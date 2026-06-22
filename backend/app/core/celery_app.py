@@ -16,9 +16,11 @@ settings = get_settings()
 # pre-forks workers and signal-based integrations only attach correctly
 # after the fork.
 @worker_process_init.connect
-def _init_sentry_in_worker(**_) -> None:
+def _init_worker(**_) -> None:
     from app.core.observability import init_sentry
+    from app.db.session import init_engine
     init_sentry()
+    init_engine()                      # no-op unless DATABASE_URL is set
 
 celery_app = Celery(
     "video_saas",

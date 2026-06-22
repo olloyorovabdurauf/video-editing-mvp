@@ -92,6 +92,26 @@ def looks_like_direct_media(url: str) -> bool:
     return urlparse(url).path.lower().endswith(_DIRECT_MEDIA_EXTS)
 
 
+def fetch_upload(upload_key: str, work_dir: Path) -> Path:
+    """
+    Pull a user-uploaded file from object storage (R2) into work_dir so it
+    enters the *exact same* pipeline as a URL/YouTube source. No yt-dlp, no
+    SSRF surface — it's our own private bucket.
+    """
+    from app.services.storage import get_storage
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dst = work_dir / "source.mp4"
+    try:
+        get_storage().download_to(upload_key, dst)
+    except Exception as e:
+        raise IngestionError("We couldn't read your uploaded file. Please re-upload and try again.",
+                             cause=e) from e
+    if not dst.exists() or dst.stat().st_size == 0:
+        raise IngestionError("The uploaded file is empty or missing.")
+    return dst
+
+
 def download_source(url: str, work_dir: Path) -> Path:
     """
     Fetch `url` into `work_dir`, returning the local file path. Raises
