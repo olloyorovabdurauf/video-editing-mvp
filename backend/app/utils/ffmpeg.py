@@ -332,6 +332,29 @@ async def extract_audio(src: Path, dst: Path, *, sample_rate: int = 16_000) -> P
     return await run(cmd)
 
 
+async def segment_audio(
+    src: Path, out_dir: Path, *, segment_seconds: int, prefix: str = "chunk"
+) -> list[Path]:
+    """
+    Split a WAV into fixed-duration chunks (for Whisper's 25MB upload limit).
+    PCM stream-copy → sample-accurate, near-instant. Returns chunks in order.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = str(out_dir / f"{prefix}_%04d.wav")
+    settings = get_settings()
+    argv = [
+        settings.ffmpeg_binary, "-hide_banner", "-nostdin", "-y",
+        "-i", str(src),
+        "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        "-c", "copy",
+        "-reset_timestamps", "1",
+        pattern,
+    ]
+    await run(argv)  # raw argv: run skips the single-output existence check
+    return sorted(out_dir.glob(f"{prefix}_*.wav"))
+
+
 async def cut(
     src: Path,
     dst: Path,

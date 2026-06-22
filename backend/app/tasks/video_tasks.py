@@ -253,6 +253,11 @@ def t_transcribe(self, ctx: dict) -> dict:
     _update(ctx["job_id"], status=ReelJobStatus.TRANSCRIBING.value, progress=0.20)
     try:
         transcript = _run(transcription.transcribe(Path(ctx["source_path"])))
+    except transcription.VideoTooLong as e:
+        # Permanent — retrying won't help. Fail the job with a user-facing message.
+        logger.warning("transcription rejected: {}", e)
+        _update(ctx["job_id"], status=ReelJobStatus.FAILED.value, message=str(e))
+        raise
     except Exception as e:
         logger.exception("transcription failed")
         raise self.retry(exc=e, countdown=10)
@@ -456,6 +461,15 @@ def t_render(self, ctx: dict) -> dict:
             job_state["user_id"], job_state["credit_hold_id"],
             actual_amount=actual,
         )
+
+    # Reclaim disk: the raw download (a long video can be 500MB+) and the
+    # intermediate b-roll clips are no longer needed once finals are rendered.
+    # Final reels live under output/ and are kept (served to the user).
+    import shutil
+    raw_dir = settings.storage_local_dir / "raw" / ctx["job_id"]
+    inter_dir = settings.storage_local_dir / "intermediate" / ctx["job_id"]
+    for d in (raw_dir, inter_dir):
+        shutil.rmtree(d, ignore_errors=True)
 
     _update(
         ctx["job_id"],

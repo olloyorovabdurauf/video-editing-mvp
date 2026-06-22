@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_transcribe_model: str = "whisper-1"
     openai_reasoning_model: str = "gpt-4o"
+    # Cap source length to bound Whisper cost/time (chunked above 20MB audio).
+    # 120 min ≈ $0.72 of Whisper at most. Raise once you have paying users.
+    max_source_minutes: int = 120
 
     # Stock footage
     pexels_api_key: str = ""
