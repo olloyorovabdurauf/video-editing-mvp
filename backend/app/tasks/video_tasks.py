@@ -14,7 +14,6 @@ import uuid
 from pathlib import Path
 
 import redis
-import yt_dlp
 from celery import chain, shared_task
 from loguru import logger
 
@@ -29,7 +28,7 @@ from app.schemas.reel import (
     Segment,
 )
 from app.services import broll as broll_svc
-from app.services import segment_picker, transcription
+from app.services import ingestion, segment_picker, transcription
 from app.utils import ffmpeg as ff
 
 settings = get_settings()
@@ -120,106 +119,6 @@ def _run(coro):
 #     worker forever.
 # ---------------------------------------------------------------------------
 
-from urllib.parse import urlparse  # noqa: E402
-
-_DIRECT_MEDIA_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".m4a", ".mp3", ".wav")
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-def _looks_like_direct_media(url: str) -> bool:
-    return urlparse(url).path.lower().endswith(_DIRECT_MEDIA_EXTS)
-
-
-# Header strategies tried in order. Different hosts block different things:
-#   - Wikimedia/w3.org 403 a bare Chrome UA (incomplete browser fingerprint)
-#     but accept curl-like or fully-formed browser requests.
-#   - Some hosts 403 non-browser UAs.
-# A real human's first paste shouldn't fail on a recoverable 403, so we fall
-# back across strategies and take the first 2xx.
-_HEADER_STRATEGIES: tuple[dict[str, str], ...] = (
-    {   # 1. Fully-formed browser fingerprint (passes most WAFs)
-        "User-Agent": _BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,video/*,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site",
-    },
-    {"User-Agent": "curl/8.7.1", "Accept": "*/*"},                  # 2. curl-like
-    {"User-Agent": "ReelForge/1.0 (+https://reelforge.app)"},       # 3. honest bot
-)
-
-_BLOCKED_STATUSES = frozenset({401, 403, 429})
-
-
-def _download_direct(url: str, dst: Path) -> Path:
-    """
-    Stream a direct media file over HTTP, trying multiple header strategies so
-    a recoverable 401/403/429 on one fingerprint falls back to the next.
-    Bounded timeouts mean a stalled host can never hang the worker.
-    """
-    import httpx
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    timeout = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
-    last_status: int | None = None
-
-    for headers in _HEADER_STRATEGIES:
-        try:
-            with httpx.stream(
-                "GET", url, follow_redirects=True, timeout=timeout, headers=headers,
-            ) as resp:
-                if resp.status_code in _BLOCKED_STATUSES:
-                    last_status = resp.status_code
-                    continue  # try the next strategy
-                resp.raise_for_status()
-                with dst.open("wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=1 << 16):
-                        f.write(chunk)
-                return dst
-        except httpx.HTTPStatusError as e:
-            last_status = e.response.status_code
-            if e.response.status_code in _BLOCKED_STATUSES:
-                continue
-            raise
-
-    raise RuntimeError(
-        f"all download strategies blocked (last HTTP {last_status}) for {url} — "
-        "the host is rejecting automated requests"
-    )
-
-
-def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
-    # NOTE: we deliberately do NOT force a global User-Agent here. yt-dlp
-    # emulates several YouTube clients (android/ios/web), each with its own UA;
-    # overriding it breaks that emulation and re-triggers bot-detection. Let
-    # yt-dlp manage headers per client. Keeping yt-dlp itself current (see
-    # requirements.txt) is what actually keeps YouTube working.
-    ydl_opts = {
-        "outtmpl": out_tmpl,
-        # Trailing "/b" so a single progressive stream still satisfies the selector.
-        "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "noprogress": True,
-        "socket_timeout": 30,       # never hang forever on a stalled host
-        "retries": 5,
-        "extractor_retries": 3,
-        "fragment_retries": 10,     # ride out transient 4xx on individual fragments
-        "concurrent_fragment_downloads": 4,   # faster DASH fetches
-    }
-    # Route through a residential proxy when configured. This is what makes
-    # YouTube reliable at scale — datacenter IPs get 403'd on data fetches.
-    if settings.ytdlp_proxy:
-        ydl_opts["proxy"] = settings.ytdlp_proxy
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
-
-
 # ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
@@ -234,22 +133,15 @@ def t_download(self, job_id: str, payload: dict) -> dict:
     url = str(req.source_url)
 
     try:
-        if _looks_like_direct_media(url):
-            src = _download_direct(url, work / "source.mp4")
-        else:
-            src = _download_via_ytdlp(url, str(work / "source.%(ext)s"))
-        if not src.exists() or src.stat().st_size == 0:
-            raise RuntimeError("download produced no file")
-    except Exception as e:
-        logger.exception("download failed for job {}", job_id)
-        # On the final retry, mark the job FAILED so it never hangs in
-        # "downloading" (the chain stops here — there's no ctx for the
-        # failure signal to recover from on this first task).
-        if self.request.retries >= self.max_retries:
-            _update(job_id, status=ReelJobStatus.FAILED.value,
-                    message=f"download failed: {type(e).__name__}: {e}")
-            raise
-        raise self.retry(exc=e, countdown=5)
+        src = ingestion.download_source(url, work)
+    except ingestion.IngestionError as e:
+        logger.warning("ingestion failed for job {}: {}", job_id, e)
+        # Retry transient blocks (403/429/timeout); fail permanent ones (private,
+        # age-restricted) immediately with the user-facing message.
+        if e.retryable and self.request.retries < self.max_retries:
+            raise self.retry(exc=e, countdown=15)
+        _update(job_id, status=ReelJobStatus.FAILED.value, message=e.user_message)
+        raise
 
     return {"job_id": job_id, "payload": payload, "source_path": str(src)}
 
@@ -276,7 +168,8 @@ def t_transcribe(self, ctx: dict) -> dict:
         "words": [w.__dict__ for w in transcript.words],
     }), encoding="utf-8")
 
-    return {**ctx, "transcript_path": str(tpath)}
+    audio_minutes = round((transcript.words[-1].end / 60.0) if transcript.words else 0.0, 2)
+    return {**ctx, "transcript_path": str(tpath), "audio_minutes": audio_minutes}
 
 
 @shared_task(name="pipeline.analyze", queue="ai", bind=True, max_retries=2)
@@ -477,12 +370,26 @@ def t_render(self, ctx: dict) -> dict:
     for d in (raw_dir, inter_dir):
         shutil.rmtree(d, ignore_errors=True)
 
+    # Observability: cost + processing time, written into job state.
+    from app.core import metrics
+    n_ai = sum(len(v) for v in (ctx.get("ai_broll_by_segment") or {}).values())
+    cost = metrics.estimate_job_cost_usd(
+        audio_minutes=float(ctx.get("audio_minutes", 0.0)),
+        n_clips=len(artifacts), ai_broll_clips=n_ai,
+    )
+    prior = json.loads(r.get(_key(ctx["job_id"])) or "{}")
+    proc_s = round(metrics.now() - prior.get("created_at", metrics.now()), 1)
+
     _update(
         ctx["job_id"],
         status=ReelJobStatus.SUCCEEDED.value,
         progress=1.0,
         artifacts=[a.model_dump(mode="json") for a in artifacts],
+        cost_usd=cost,
+        processing_time_s=proc_s,
+        audio_minutes=ctx.get("audio_minutes", 0.0),
     )
+    logger.info("job {} done: {} reels, ${} cost, {}s", ctx["job_id"], len(artifacts), cost, proc_s)
     return {"job_id": ctx["job_id"], "ok": True}
 
 
@@ -515,10 +422,12 @@ def enqueue_reel_job(req: ReelCreateRequest) -> str:
     if settings.require_credits and req.user_id != "anonymous":
         hold_id = billing.hold(req.user_id, estimated, job_id=job_id)
 
+    from app.core import metrics
     _update(
         job_id,
         status=ReelJobStatus.QUEUED.value, progress=0.0, artifacts=[],
         user_id=req.user_id, credit_hold_id=hold_id, credits_held=estimated,
+        created_at=metrics.now(),     # for processing-time metric
     )
 
     # 2. Build pipeline. Bridge into creative engine only if AI b-roll on.

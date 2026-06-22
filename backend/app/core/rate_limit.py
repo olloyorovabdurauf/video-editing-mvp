@@ -11,11 +11,13 @@ limiter are drop-in upgrades — but most apps never need to upgrade.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 
 import redis
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
 
 from app.config import get_settings
+from app.core.auth import optional_user
 
 _r = redis.from_url(get_settings().redis_url, decode_responses=True)
 
@@ -60,19 +62,13 @@ def rate_limit(scope: str, *, max_per_window: int, window_s: int):
     the client IP. Behind a proxy you'll want to trust X-Forwarded-For —
     that's a separate ProxyHeadersMiddleware concern.
     """
-    async def dep(request: Request) -> None:
-        # Identity for the bucket. In prod we NEVER trust X-User-Id — it's a
-        # client-controlled header, and trusting it means rotating one header
-        # value resets your limit. IP is coarse but unforgeable (we run behind
-        # uvicorn --proxy-headers, so client.host is the real peer).
-        # Dev keeps the header for convenient per-user testing.
-        settings = get_settings()
-        if settings.is_prod:
-            identity = request.client.host if request.client else "anon"
-        else:
-            identity = request.headers.get("X-User-Id") or (
-                request.client.host if request.client else "anon"
-            )
+    async def dep(request: Request, user: str | None = Depends(optional_user)) -> None:
+        # Prefer the *verified* user id (forgery-proof: it came from a signed
+        # JWT) so a logged-in user's limit follows them across IPs and a NAT'd
+        # office doesn't share one bucket. Fall back to peer IP for anonymous
+        # callers (we run behind --proxy-headers, so client.host is the real peer).
+        identity = (f"u:{user}" if user and user != "anonymous"
+                    else f"ip:{request.client.host if request.client else 'anon'}")
         allowed, count = _check(scope, identity, max_per_window=max_per_window, window_s=window_s)
         if not allowed:
             raise HTTPException(
@@ -81,3 +77,35 @@ def rate_limit(scope: str, *, max_per_window: int, window_s: int):
                 headers={"Retry-After": str(window_s)},
             )
     return dep
+
+
+# ---------------------------------------------------------------------------
+# Daily per-user job quota — abuse / cost guard distinct from the burst limiter.
+# Each video job costs real money (Whisper + GPT-4o); a single user shouldn't be
+# able to launch hundreds/day. Counter resets at UTC midnight via key TTL.
+# ---------------------------------------------------------------------------
+
+class QuotaExceeded(Exception):
+    def __init__(self, used: int, limit: int):
+        self.used, self.limit = used, limit
+        super().__init__(f"daily job quota reached: {used}/{limit}")
+
+
+def consume_daily_job_quota(user_id: str, *, limit: int) -> int:
+    """
+    Atomically increment today's job count for a user; raise QuotaExceeded if
+    over `limit`. Returns the new count. Anonymous/dev callers are not capped
+    here (billing/credits guard those paths).
+    """
+    if not user_id or user_id == "anonymous" or limit <= 0:
+        return 0
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    key = f"quota:jobs:{user_id}:{today}"
+    pipe = _r.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, 60 * 60 * 26)   # ~1 day + slack; self-cleans
+    used, _ = pipe.execute()
+    used = int(used)
+    if used > limit:
+        raise QuotaExceeded(used, limit)
+    return used

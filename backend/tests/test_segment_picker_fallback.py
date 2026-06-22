@@ -122,15 +122,48 @@ async def test_lenient_fallback_used_when_strict_empty():
 
 
 @pytest.mark.asyncio
-async def test_synthesis_when_both_llm_passes_empty():
-    """Even if both LLM passes return nothing, a speech video yields one clip."""
+async def test_synthesis_when_all_llm_passes_empty():
+    """All passes (cheap → escalate → lenient) empty → synthesis still yields one."""
     t = _transcript([("here", 2.0, 2.4), ("we", 2.5, 2.7), ("are", 2.8, 3.2)])
     empty = _mock_resp({"segments": []})
     with patch.object(sp, "AsyncOpenAI") as oai:
-        oai.return_value.chat.completions.create = AsyncMock(side_effect=[empty, empty])
+        oai.return_value.chat.completions.create = AsyncMock(side_effect=[empty, empty, empty])
         out = await sp.pick_segments(t, n=1, max_duration_s=20, prompt=None)
     assert len(out) == 1
     assert out[0].reason.startswith("Best available")
+
+
+@pytest.mark.asyncio
+async def test_cheap_model_used_first_then_escalates():
+    """Cost tiering: cheap model on the first call; strong model only when empty."""
+    from app.config import get_settings
+    s = get_settings()
+    t = _transcript([("a", 1.0, 1.4), ("b", 1.5, 18.0)])
+    empty = _mock_resp({"segments": []})
+    found = _mock_resp({"segments": [{"start": 1, "end": 17, "hook_score": 0.8, "reason": "r"}]})
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        create = AsyncMock(side_effect=[empty, found])    # cheap empty → escalate finds it
+        oai.return_value.chat.completions.create = create
+        out = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
+    assert len(out) == 1
+    models = [c.kwargs["model"] for c in create.call_args_list]
+    assert models[0] == s.openai_analysis_model       # cheap first
+    assert models[1] == s.openai_escalation_model     # escalated only after empty
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_short_circuits(patched_redis):
+    """A second identical call returns from cache without hitting the LLM."""
+    t = _transcript([("hook", 5.0, 5.4), ("worthy", 5.5, 20.0)])
+    found = _mock_resp({"segments": [{"start": 5, "end": 19, "hook_score": 0.9, "reason": "r"}]})
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        create = AsyncMock(return_value=found)
+        oai.return_value.chat.completions.create = create
+        first = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
+        calls_after_first = create.call_count
+        second = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
+    assert len(first) == 1 and len(second) == 1
+    assert create.call_count == calls_after_first      # no new LLM calls on 2nd run
 
 
 @pytest.mark.asyncio
@@ -145,7 +178,7 @@ async def test_truncated_json_does_not_crash():
         '{"segments": [{"start": 1, "end": 18, "reason": "an unterminated'
     )
     with patch.object(sp, "AsyncOpenAI") as oai:
-        oai.return_value.chat.completions.create = AsyncMock(side_effect=[truncated, truncated])
+        oai.return_value.chat.completions.create = AsyncMock(side_effect=[truncated, truncated, truncated])
         out = await sp.pick_segments(t, n=1, max_duration_s=20, prompt=None)
     assert len(out) == 1                      # never zero, never crashes
     assert out[0].reason.startswith("Best available")

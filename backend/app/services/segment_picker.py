@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 
 from app.config import get_settings
 from app.schemas.reel import Segment
+from app.services import ai_cache
 from app.services.transcription import Transcript
 
 SYSTEM_PROMPT = """\
@@ -107,50 +108,55 @@ async def pick_segments(
     if not compressed:
         return []
 
-    logger.info("picking {} segments from {} chars of transcript", n, len(compressed))
-    resp = await client.chat.completions.create(
-        model=settings.openai_reasoning_model,
-        response_format={"type": "json_object"},
-        temperature=0.4,
-        max_tokens=1500,            # ample for N segments without transcripts
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT.format(n=n, max_dur=max_duration_s)},
-            {"role": "user",   "content": USER_TEMPLATE.format(
-                prompt=prompt or "(none)", lines=compressed
-            )},
-        ],
-    )
-    out = _clamp(_safe_segments(resp), transcript, max_duration_s, min_dur=5.0)
-    out.sort(key=lambda x: x.hook_score, reverse=True)
-    if out:
-        return out[:n]
+    # Cache: same video + same params → reuse picks (free + instant on retry).
+    ck = ai_cache.key("segpick", compressed, n, max_duration_s, prompt or "")
+    cached = ai_cache.get_json(ck)
+    if cached is not None:
+        logger.info("segment picks cache hit")
+        return [Segment(**d) for d in cached]
 
-    # --- Fallback 1: nothing met the strict bar. Ask for the best available. ---
-    logger.info("strict pass returned 0 segments; running lenient fallback")
-    try:
-        resp2 = await client.chat.completions.create(
-            model=settings.openai_reasoning_model,
+    async def _ask(model: str, system: str, temperature: float, min_dur: float) -> list[Segment]:
+        resp = await client.chat.completions.create(
+            model=model,
             response_format={"type": "json_object"},
-            temperature=0.5,
-            max_tokens=600,
+            temperature=temperature,
+            max_tokens=1500,
             messages=[
-                {"role": "system", "content": LENIENT_SYSTEM_PROMPT.format(max_dur=max_duration_s)},
+                {"role": "system", "content": system},
                 {"role": "user",   "content": USER_TEMPLATE.format(
-                    prompt=prompt or "(none)", lines=compressed
-                )},
+                    prompt=prompt or "(none)", lines=compressed)},
             ],
         )
-        out = _clamp(_safe_segments(resp2), transcript, max_duration_s, min_dur=4.0)
-        out.sort(key=lambda x: x.hook_score, reverse=True)
-        if out:
-            return out[:n]
-    except Exception as e:
-        logger.warning("lenient fallback failed: {}", e)
+        picks = _clamp(_safe_segments(resp), transcript, max_duration_s, min_dur=min_dur)
+        picks.sort(key=lambda x: x.hook_score, reverse=True)
+        return picks
 
-    # --- Fallback 2: synthesize from the transcript bounds (deterministic). ---
-    # Guarantees a clipping tool never returns nothing for a video with speech.
-    synth = _synthesize_from_transcript(transcript, max_duration_s)
-    return [synth] if synth else []
+    strict = SYSTEM_PROMPT.format(n=n, max_dur=max_duration_s)
+    lenient = LENIENT_SYSTEM_PROMPT.format(max_dur=max_duration_s)
+
+    # Cost tiering: cheap model first; escalate to the strong model ONLY when
+    # the cheap pass finds nothing. Most videos never touch the expensive model.
+    out: list[Segment] = []
+    try:
+        logger.info("analysis (cheap={}) on {} chars", settings.openai_analysis_model, len(compressed))
+        out = await _ask(settings.openai_analysis_model, strict, 0.4, min_dur=5.0)
+        if not out:
+            logger.info("cheap pass empty → escalating to {}", settings.openai_escalation_model)
+            out = await _ask(settings.openai_escalation_model, strict, 0.4, min_dur=5.0)
+        if not out:  # still nothing viral → best-available with strong model
+            out = await _ask(settings.openai_escalation_model, lenient, 0.5, min_dur=4.0)
+    except Exception as e:
+        logger.warning("segment analysis failed: {}", e)
+
+    # Last resort: deterministic synthesis (never return nothing for speech).
+    if not out:
+        synth = _synthesize_from_transcript(transcript, max_duration_s)
+        out = [synth] if synth else []
+
+    out = out[:n]
+    if out:
+        ai_cache.set_json(ck, [s.model_dump() for s in out], ttl_s=settings.segment_cache_ttl_s)
+    return out
 
 
 def _safe_segments(resp: Any) -> list[dict]:

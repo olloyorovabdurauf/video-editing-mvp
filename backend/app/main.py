@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.v1.router import api_router
 from app.config import get_settings
 from app.core.logging import configure_logging
-from app.core.middleware import RequestIDMiddleware
+from app.core.middleware import MaxBodySizeMiddleware, RequestIDMiddleware
 
 
 @asynccontextmanager
@@ -36,13 +36,17 @@ def create_app() -> FastAPI:
     # Middleware order matters: outermost first. RequestID first so its
     # contextvar binding wraps every other layer including CORS rejections.
     app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(MaxBodySizeMiddleware, max_bytes=settings.max_request_body_bytes)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins.split(",") if settings.is_prod else ["*"],
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        # Explicit allow-list in prod (no wildcard with credentials) — browsers
+        # reject "*" + credentials anyway, and it's good hygiene.
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-User-Id"],
         expose_headers=["X-Request-ID"],
+        max_age=600,
     )
     app.include_router(api_router, prefix="/api/v1")
     app.mount(

@@ -99,8 +99,14 @@ class ReelJobStatus(str, Enum):
 
 
 class ReelJobResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")   # tolerate internal job-state keys
+
     job_id: str
     status: ReelJobStatus
     progress: float = Field(0.0, ge=0, le=1)
     message: str | None = None
     artifacts: list[ReelArtifact] = []
+    # Observability (populated on completion)
+    cost_usd: float | None = None
+    processing_time_s: float | None = None
+    audio_minutes: float | None = None

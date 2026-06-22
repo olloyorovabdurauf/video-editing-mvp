@@ -25,7 +25,15 @@ from app.config import get_settings
 
 class StorageBackend(Protocol):
     def put(self, local_path: Path, *, key: str) -> str:
-        """Upload local_path to `key`; return a publicly accessible URL."""
+        """Upload local_path to `key`; return a URL the client can fetch."""
+
+    def presigned_upload(self, key: str, *, content_type: str, max_bytes: int,
+                         expires_s: int = 3600) -> dict:
+        """Return {url, fields, key} for a direct browser→bucket upload,
+        constrained to <= max_bytes. Bucket stays private."""
+
+    def presigned_download(self, key: str, *, expires_s: int = 3600) -> str:
+        """Time-limited GET URL for a private object."""
 
     def delete(self, key: str) -> None:
         ...
@@ -46,6 +54,15 @@ class LocalStorage:
         if local_path.resolve() != dst.resolve():
             shutil.copy2(local_path, dst)
         # Returns the path under /storage. Frontend resolves against API origin.
+        return f"/storage/{key}"
+
+    def presigned_upload(self, key: str, *, content_type: str, max_bytes: int,
+                         expires_s: int = 3600) -> dict:
+        # Dev convenience: PUT straight to the local dev upload endpoint.
+        return {"url": f"/storage-upload/{key}", "fields": {}, "key": key,
+                "method": "PUT", "max_bytes": max_bytes}
+
+    def presigned_download(self, key: str, *, expires_s: int = 3600) -> str:
         return f"/storage/{key}"
 
     def delete(self, key: str) -> None:
@@ -90,6 +107,30 @@ class S3Storage:
             "get_object",
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=7 * 24 * 3600,
+        )
+
+    def presigned_upload(self, key: str, *, content_type: str, max_bytes: int,
+                         expires_s: int = 3600) -> dict:
+        """
+        Presigned POST → browser uploads directly to R2, bucket stays private.
+        The content-length-range condition is server-enforced abuse prevention:
+        R2 rejects the upload if it exceeds max_bytes (can't be bypassed client-side).
+        """
+        post = self.client.generate_presigned_post(
+            Bucket=self.bucket, Key=key,
+            Fields={"Content-Type": content_type},
+            Conditions=[
+                {"Content-Type": content_type},
+                ["content-length-range", 1, max_bytes],
+            ],
+            ExpiresIn=expires_s,
+        )
+        return {"url": post["url"], "fields": post["fields"], "key": key,
+                "method": "POST", "max_bytes": max_bytes}
+
+    def presigned_download(self, key: str, *, expires_s: int = 3600) -> str:
+        return self.client.generate_presigned_url(
+            "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires_s,
         )
 
     def delete(self, key: str) -> None:

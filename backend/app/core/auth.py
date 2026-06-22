@@ -76,6 +76,13 @@ async def require_user(
             req.user_id = user_id          # override anything client sent
             ...
     """
+    # Memoize per request: an endpoint may resolve the user twice (e.g. the
+    # rate-limit dep AND the handler), and we don't want to verify the JWT or
+    # re-fetch JWKS twice. request.state survives for the whole request.
+    cached = getattr(request.state, "user_id", None)
+    if cached is not None:
+        return cached
+
     settings = get_settings()
     mode = settings.auth_mode.lower()
 
@@ -86,7 +93,9 @@ async def require_user(
                 "AUTH_MODE=none is forbidden in production. "
                 "Set AUTH_MODE=clerk + CLERK_JWKS_URL."
             )
-        return x_user_id or "anonymous"
+        uid = x_user_id or "anonymous"
+        request.state.user_id = uid
+        return uid
 
     if mode in ("clerk", "custom"):
         if not authorization or not authorization.lower().startswith("bearer "):

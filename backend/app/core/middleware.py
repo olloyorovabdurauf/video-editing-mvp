@@ -28,6 +28,31 @@ from starlette.responses import Response
 REQUEST_ID_HEADER = "X-Request-ID"
 
 
+class MaxBodySizeMiddleware(BaseHTTPMiddleware):
+    """
+    Reject oversized request bodies early (413) so a spammer can't stream a
+    multi-GB body into the API. JSON API requests are tiny; real video bytes
+    go straight to R2 via signed URLs, never through this server.
+    """
+
+    def __init__(self, app, *, max_bytes: int):
+        super().__init__(app)
+        self.max_bytes = max_bytes
+
+    async def dispatch(self, request: Request, call_next):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                if int(cl) > self.max_bytes:
+                    return Response(
+                        status_code=413,
+                        content=f"request body too large (max {self.max_bytes} bytes)",
+                    )
+            except ValueError:
+                return Response(status_code=400, content="invalid Content-Length")
+        return await call_next(request)
+
+
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         req_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex[:16]

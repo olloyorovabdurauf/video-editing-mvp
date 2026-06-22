@@ -38,10 +38,12 @@ def patched_redis(monkeypatch):
     import app.services.billing as billing_mod
     import app.core.rate_limit as rl_mod
     import app.services.creative_engine.cache as cache_mod
+    import app.services.ai_cache as ai_cache_mod
 
     monkeypatch.setattr(billing_mod, "_r", fake)
     monkeypatch.setattr(rl_mod, "_r", fake)
     monkeypatch.setattr(cache_mod, "_r", fake)
+    monkeypatch.setattr(ai_cache_mod, "_r", fake)
 
     # The rate limiter pre-registered its Lua against the real client. Re-register.
     monkeypatch.setattr(rl_mod, "_LIMITER_LUA", fake.register_script(rl_mod._LIMITER_LUA.script))

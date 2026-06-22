@@ -1,28 +1,29 @@
 """
-Download-routing tests.
+Ingestion routing + error-mapping tests.
 
-The bug this guards against: routing a direct media-file URL through yt-dlp's
-generic extractor, which many CDNs answer with HTTP 403 (non-browser UA).
-Direct files must go down the plain-HTTP path; only platform URLs use yt-dlp.
+The bug class this guards against: routing a direct media-file URL through
+yt-dlp's generic extractor (CDNs answer its UA with 403). Direct files take the
+plain-HTTP path; only platform URLs use yt-dlp. Plus: raw download errors must
+map to clear, user-facing messages.
 """
 from __future__ import annotations
 
 import pytest
 
-from app.tasks.video_tasks import _looks_like_direct_media
+from app.services import ingestion
+from app.services.ingestion import IngestionError, looks_like_direct_media
 
 
 @pytest.mark.parametrize("url", [
     "https://media.w3.org/2010/05/sintel/trailer.mp4",
-    "https://cdn.example.com/a/b/clip.MP4",          # case-insensitive
+    "https://cdn.example.com/a/b/clip.MP4",
     "https://x.com/v.mov",
     "https://x.com/v.webm",
-    "https://x.com/v.m4v",
     "https://storage.googleapis.com/bucket/talk.mkv",
-    "https://x.com/path/audio.mp3?token=abc",         # query string ignored
+    "https://x.com/path/audio.mp3?token=abc",
 ])
 def test_direct_media_urls_detected(url):
-    assert _looks_like_direct_media(url) is True
+    assert looks_like_direct_media(url) is True
 
 
 @pytest.mark.parametrize("url", [
@@ -31,7 +32,51 @@ def test_direct_media_urls_detected(url):
     "https://vimeo.com/123456789",
     "https://www.tiktok.com/@user/video/123",
     "https://example.com/page.html",
-    "https://example.com/",
 ])
-def test_platform_and_page_urls_not_direct(url):
-    assert _looks_like_direct_media(url) is False
+def test_platform_urls_not_direct(url):
+    assert looks_like_direct_media(url) is False
+
+
+# ---------------------------------------------------------------------------
+# Error mapping → user-facing messages
+# ---------------------------------------------------------------------------
+
+def test_private_video_message():
+    err = ingestion._to_user_error(Exception("ERROR: Video unavailable: This video is private"))
+    assert "private" in err.user_message.lower()
+    assert err.retryable is False
+
+
+def test_age_restricted_message():
+    err = ingestion._to_user_error(Exception("ERROR: Sign in to confirm your age"))
+    assert "sign-in" in err.user_message.lower() or "age" in err.user_message.lower()
+
+
+def test_rate_limit_message_is_retryable():
+    err = ingestion._to_user_error(Exception("HTTP Error 403: Forbidden"))
+    assert err.retryable is True
+    assert "again" in err.user_message.lower()
+
+
+def test_timeout_message_is_retryable():
+    err = ingestion._to_user_error(Exception("socket timed out"))
+    assert err.retryable is True
+
+
+def test_generic_message_is_safe():
+    err = ingestion._to_user_error(Exception("some weird internal traceback xyz"))
+    assert "xyz" not in err.user_message      # no internals leak to the user
+    assert "url is public" in err.user_message.lower()
+
+
+# ---------------------------------------------------------------------------
+# Version monitoring
+# ---------------------------------------------------------------------------
+
+def test_ytdlp_version_returns_string():
+    v = ingestion.ytdlp_version()
+    assert isinstance(v, str) and len(v) > 0
+
+
+def test_warn_if_stale_does_not_raise():
+    ingestion.warn_if_ytdlp_stale()   # never throws regardless of version

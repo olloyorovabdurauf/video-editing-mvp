@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     cors_origins: str = "https://your.domain"     # comma-separated in prod
     rate_limit_reels_per_min: int = 10
     rate_limit_reels_window_s: int = 60
+    # Abuse / cost guards
+    max_jobs_per_user_per_day: int = 50           # distinct from burst limit
+    max_request_body_bytes: int = 2 * 1024 * 1024  # JSON API only; video → R2 signed URLs
+
+    # AI cost optimization (Area 5)
+    # Cheap model does first-pass analysis; we escalate to the strong model
+    # only when the cheap pass returns nothing usable.
+    openai_analysis_model: str = "gpt-4o-mini"
+    openai_escalation_model: str = "gpt-4o"
+    segment_cache_ttl_s: int = 7 * 24 * 3600       # re-runs of same video reuse picks
 
     # Auth — see app/core/auth.py
     auth_mode: str = "none"                       # none | clerk | custom

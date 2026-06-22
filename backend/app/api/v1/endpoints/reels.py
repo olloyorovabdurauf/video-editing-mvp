@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.config import get_settings
 from app.core.auth import require_user
-from app.core.rate_limit import rate_limit
+from app.core.rate_limit import QuotaExceeded, consume_daily_job_quota, rate_limit
 from app.schemas.reel import ReelCreateRequest, ReelJobResponse
 from app.services import billing
 from app.services.url_guard import UnsafeURLError, validate_source_url
@@ -39,6 +39,13 @@ async def create_reel(
     """
     # The token is the truth — override whatever the client put in the body.
     req.user_id = user_id
+
+    # Daily per-user job quota (cost/abuse guard, separate from burst limit).
+    try:
+        consume_daily_job_quota(user_id, limit=_s.max_jobs_per_user_per_day)
+    except QuotaExceeded as e:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(e),
+                            headers={"Retry-After": "3600"})
 
     # SSRF guard: we fetch this URL server-side; refuse anything that
     # resolves to internal/private address space.

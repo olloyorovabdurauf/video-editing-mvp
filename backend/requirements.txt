@@ -46,6 +46,12 @@ PyYAML==6.0.2
 # --- Storage ---
 boto3==1.35.30               # S3-compatible
 
+# --- Database (durable records: users, billing, usage). Wired in the DB PR;
+#     models live in app/db/models.py. Redis stays the hot job-state store. ---
+sqlalchemy==2.0.35
+alembic==1.13.3
+psycopg[binary]==3.2.3
+
 # --- Dev ---
 pytest==8.3.3
 pytest-asyncio==0.24.0
