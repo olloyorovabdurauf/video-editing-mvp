@@ -144,23 +144,32 @@ def hold(user_id: str, amount: int, *, job_id: str) -> str | None:
         return f"hold:{job_id}"
 
 
-def settle(user_id: str, hold_id: str, *, held: int, actual: int) -> int | None:
-    """Adjust a hold to the actual cost (refund the unspent part)."""
+def _held_for(s: Session, job_id: str) -> int:
+    """How much the hold for this job reserved (the hold entry has delta=-held)."""
+    delta = s.scalar(select(models.LedgerEntry.delta).where(
+        models.LedgerEntry.kind == "hold", models.LedgerEntry.ref == job_id))
+    return -int(delta) if delta is not None else 0
+
+
+def settle(user_id: str, hold_id: str, *, actual: int) -> int | None:
+    """Adjust a hold to the actual cost (refund the unspent part). Idempotent."""
     job_id = hold_id.split(":", 1)[-1]
     with session_scope() as s:
         if s is None:
             return None
+        held = _held_for(s, job_id)
         _append(s, user_id=user_id, delta=(held - actual), kind="settle",
                 ref=job_id, idem=f"settle:{job_id}")
         return _balance(s, user_id)
 
 
-def refund(user_id: str, hold_id: str, *, held: int) -> int | None:
+def refund(user_id: str, hold_id: str) -> int | None:
     """Return the full held amount (job failed). Idempotent."""
     job_id = hold_id.split(":", 1)[-1]
     with session_scope() as s:
         if s is None:
             return None
+        held = _held_for(s, job_id)
         _append(s, user_id=user_id, delta=abs(held), kind="refund",
                 ref=job_id, idem=f"refund:{job_id}")
         return _balance(s, user_id)

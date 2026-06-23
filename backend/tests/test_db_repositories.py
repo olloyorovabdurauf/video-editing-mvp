@@ -81,7 +81,7 @@ def test_hold_then_settle_refunds_unspent(db):
     u = _user(db)
     repo.credit(u, 500, source="t", idempotency_key="cs_2")
     hold_id = repo.hold(u, 100, job_id="j2")       # balance 400
-    repo.settle(u, hold_id, held=100, actual=60)   # used 60 → +40 back
+    repo.settle(u, hold_id, actual=60)   # used 60 → +40 back
     assert repo.get_balance(u) == 440
 
 
@@ -89,7 +89,7 @@ def test_hold_then_settle_charges_overage(db):
     u = _user(db)
     repo.credit(u, 500, source="t", idempotency_key="cs_3")
     hold_id = repo.hold(u, 100, job_id="j3")
-    repo.settle(u, hold_id, held=100, actual=150)  # 50 over → 400 - 50
+    repo.settle(u, hold_id, actual=150)  # 50 over → 400 - 50
     assert repo.get_balance(u) == 350
 
 
@@ -97,7 +97,7 @@ def test_refund_returns_full_hold(db):
     u = _user(db)
     repo.credit(u, 500, source="t", idempotency_key="cs_4")
     hold_id = repo.hold(u, 100, job_id="j4")       # 400
-    repo.refund(u, hold_id, held=100)              # +100 → 500
+    repo.refund(u, hold_id)              # +100 → 500
     assert repo.get_balance(u) == 500
 
 
@@ -105,8 +105,8 @@ def test_double_refund_safe(db):
     u = _user(db)
     repo.credit(u, 500, source="t", idempotency_key="cs_5")
     hold_id = repo.hold(u, 100, job_id="j5")
-    repo.refund(u, hold_id, held=100)
-    repo.refund(u, hold_id, held=100)              # idempotent — no double credit
+    repo.refund(u, hold_id)
+    repo.refund(u, hold_id)              # idempotent — no double credit
     assert repo.get_balance(u) == 500
 
 

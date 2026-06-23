@@ -44,10 +44,17 @@ def init_engine(url: str | None = None) -> None:
     if not url:
         logger.info("DATABASE_URL unset — DB layer disabled (Redis-only mode)")
         return
+    connect_args: dict = {"connect_timeout": 10}
+    if "psycopg" in _normalize(url):
+        # Fly MPG / pgbouncer use TRANSACTION pooling, which is incompatible
+        # with server-side prepared statements. Disabling them (None) is the
+        # documented psycopg3 + pgbouncer setting — small perf cost at our scale.
+        connect_args["prepare_threshold"] = None
     _engine = create_engine(
         _normalize(url),
-        pool_pre_ping=True,       # survive Neon idle-disconnects
+        pool_pre_ping=True,       # survive pooler idle-disconnects
         pool_size=5, max_overflow=5,
+        connect_args=connect_args,
         future=True,
     )
     _Session = sessionmaker(bind=_engine, expire_on_commit=False, class_=Session)

@@ -89,12 +89,27 @@ def _idem_key(key: str) -> str:
     return f"idem:{key}"
 
 
+# Durable cutover: when DATABASE_URL is set, money lives in Postgres (durable,
+# append-only ledger). Until then, the Redis path below runs unchanged. There
+# is no live paying money yet, so this flip is safe to land before launch.
+def _use_db() -> bool:
+    from app.db.session import db_enabled
+    return db_enabled()
+
+
 def get_balance(user_id: str) -> int:
+    if _use_db():
+        from app.db import repositories
+        return repositories.get_balance(user_id) or 0
     return int(_r.get(_wallet_key(user_id)) or 0)
 
 
 def credit(user_id: str, amount: int, *, source: str, idempotency_key: str) -> int:
     """Add credits. Idempotent on idempotency_key (e.g. Stripe charge id)."""
+    if _use_db():
+        from app.db import repositories
+        return repositories.credit(user_id, amount, source=source,
+                                   idempotency_key=idempotency_key) or 0
     if amount <= 0:
         return get_balance(user_id)
     if _r.set(_idem_key(idempotency_key), "1", nx=True, ex=86400 * 30) is None:
@@ -117,6 +132,12 @@ def hold(user_id: str, amount: int, *, job_id: str) -> str:
     """
     if amount < 0:
         raise ValueError("amount must be >= 0")
+    if _use_db():
+        from app.db import repositories
+        try:
+            return repositories.hold(user_id, amount, job_id=job_id)
+        except repositories.InsufficientCredits as e:
+            raise InsufficientCredits(str(e)) from e
     hold_id = uuid.uuid4().hex
     # Atomic check-then-decrement via Lua to prevent race with another debit.
     script = _r.register_script("""
@@ -148,6 +169,10 @@ def settle(user_id: str, hold_id: str, *, actual_amount: int) -> None:
     difference. If actual_amount > held, debit additionally (this should be
     rare — it means our estimate was low).
     """
+    if _use_db():
+        from app.db import repositories
+        repositories.settle(user_id, hold_id, actual=actual_amount)
+        return
     held = _r.hgetall(f"hold:{hold_id}") or {}
     if not held:
         return  # already settled or never existed
@@ -174,6 +199,10 @@ def settle(user_id: str, hold_id: str, *, actual_amount: int) -> None:
 
 def refund(user_id: str, hold_id: str) -> None:
     """Full refund (job failed before any work)."""
+    if _use_db():
+        from app.db import repositories
+        repositories.refund(user_id, hold_id)
+        return
     held = _r.hgetall(f"hold:{hold_id}") or {}
     if not held:
         return
