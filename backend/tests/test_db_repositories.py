@@ -54,6 +54,20 @@ def test_upsert_user_idempotent(db):
     assert a is not None and a == b
 
 
+def test_upsert_user_grants_signup_credits_once(db):
+    # First login grants the free credits, atomically with user creation.
+    uid = repo.upsert_user("clerk_sub_new", "n@example.com", signup_credits=500)
+    assert repo.get_balance(uid) == 500
+    # A returning login hits the existing-user branch — no second grant.
+    again = repo.upsert_user("clerk_sub_new", "n@example.com", signup_credits=500)
+    assert again == uid and repo.get_balance(uid) == 500
+
+
+def test_upsert_user_no_grant_when_zero(db):
+    uid = repo.upsert_user("clerk_sub_free", "f@example.com")  # default 0
+    assert repo.get_balance(uid) == 0
+
+
 # ---------------------------------------------------------------------------
 # Credit ledger — money correctness
 # ---------------------------------------------------------------------------

@@ -5,9 +5,8 @@
 #
 # Deploy: flyctl deploy -c deploy/fly/fly.mvp.toml --remote-only
 #
-# NOTE: APP_ENV=development is deliberate for the private smoke test — it keeps
-# auth permissive (X-User-Id / anonymous) and CORS open so we can curl the API
-# directly. Flip to production + Clerk + locked CORS before real users.
+# PRODUCTION: APP_ENV=production, AUTH_MODE=clerk (JWT verified per request),
+# CORS locked to the Vercel origin, credit gate on. /docs is hidden in prod.
 
 app = "reelforge-mvp-x7k2"
 primary_region = "fra"          # close to the user (Central Asia → Frankfurt)
@@ -47,11 +46,15 @@ primary_region = "fra"          # close to the user (Central Asia → Frankfurt)
   processes = ["app"]
 
 [env]
-  APP_ENV = "development"        # CORS still open; flip to production with the prod-hardening pass
+  APP_ENV = "production"         # hides /docs + locks CORS to CORS_ORIGINS
   STORAGE_BACKEND = "local"
   STORAGE_LOCAL_DIR = "/app/storage"
-  AUTH_MODE = "clerk"            # every require_user endpoint now verifies a Clerk JWT
+  AUTH_MODE = "clerk"            # every require_user endpoint verifies a Clerk JWT
   CLERK_JWKS_URL = "https://suitable-oryx-42.clerk.accounts.dev/.well-known/jwks.json"
-  REQUIRE_CREDITS = "false"      # keep off until signup-credit grant is wired
+  CORS_ORIGINS = "https://video-editing-mvp.vercel.app"
+  REQUIRE_CREDITS = "true"       # credit gate on; new users get signup_credits free
   PYTHONUNBUFFERED = "1"
+  # NOTE: these [env] values did NOT reliably apply on `flyctl deploy` for this
+  # app — the same keys are also set via `flyctl secrets set`, which is what
+  # actually takes effect at runtime. Keep both in sync.
   # OPENAI_API_KEY, REDIS_URL, CELERY_* → flyctl secrets set (never in this file)

@@ -29,8 +29,14 @@ class InsufficientCredits(Exception):
 # Identity
 # ---------------------------------------------------------------------------
 
-def upsert_user(auth_provider_id: str, email: str) -> str | None:
-    """Idempotent: create the user on first login, else return existing id."""
+def upsert_user(auth_provider_id: str, email: str, signup_credits: int = 0) -> str | None:
+    """
+    Idempotent: create the user on first login, else return existing id.
+
+    On creation, grant `signup_credits` free credits in the SAME transaction so
+    a new user is never momentarily broke (the credit gate would 402 them). The
+    grant is keyed `signup:<id>`, so it can apply at most once per user, ever.
+    """
     with session_scope() as s:
         if s is None:
             return None
@@ -42,12 +48,15 @@ def upsert_user(auth_provider_id: str, email: str) -> str | None:
         s.add(user)
         try:
             s.flush()
-            return user.id
         except IntegrityError:           # race: another request created it
             s.rollback()
             again = s.scalar(select(models.User).where(
                 models.User.auth_provider_id == auth_provider_id))
             return again.id if again else None
+        if signup_credits > 0:
+            _append(s, user_id=user.id, delta=signup_credits, kind="credit",
+                    ref="signup", idem=f"signup:{user.id}")
+        return user.id
 
 
 # ---------------------------------------------------------------------------

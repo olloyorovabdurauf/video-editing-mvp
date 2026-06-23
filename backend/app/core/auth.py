@@ -169,8 +169,10 @@ def _resolve_internal_user_id(sub: str, claims: dict[str, Any]) -> str:
     # Clerk's default session token carries no email; populate it via a JWT
     # template claim if you want it. Empty string is fine (column is NOT NULL).
     email = claims.get("email") or claims.get("email_address") or ""
+    signup_credits = get_settings().signup_credits
     try:
-        internal_id = repositories.upsert_user(auth_provider_id=sub, email=email) or sub
+        internal_id = repositories.upsert_user(
+            auth_provider_id=sub, email=email, signup_credits=signup_credits) or sub
     except Exception as e:  # pragma: no cover - transient DB blip
         logger.warning("user upsert failed, using sub as id: {}", e)
         return sub

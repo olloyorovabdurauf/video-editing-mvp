@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     # If empty, requests with user_id="anonymous" bypass credits.
     require_credits: bool = False
+    # Free credits granted once, on first login (atomic with user creation).
+    # ~one AI-b-roll job (≈450) or several basic 3-reel jobs (≈90 each). Doubles
+    # as a cost-abuse cap when require_credits is on but Stripe top-up isn't live.
+    signup_credits: int = 500
 
     # Production knobs
     cors_origins: str = "https://your.domain"     # comma-separated in prod
