@@ -41,8 +41,11 @@ primary_region = "fra"          # close to the user (Central Asia → Frankfurt)
   initial_size = "10gb"
 
 [[vm]]
-  size = "shared-cpu-2x"
-  memory = "4gb"                 # ffmpeg + whisper audio + celery + uvicorn share this
+  # DEDICATED CPUs: render is libx264-bound. shared-cpu-2x throttles under load
+  # (saw loadavg 7.3 on 2 shared cores → reels took ~12min). performance-4x = 4
+  # dedicated vCPUs, no steal, so two concurrent jobs get ~2 real cores each.
+  size = "performance-4x"
+  memory = "8gb"                 # ffmpeg + whisper audio + celery + uvicorn share this
   processes = ["app"]
 
 [env]
