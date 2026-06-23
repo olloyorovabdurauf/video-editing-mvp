@@ -133,3 +133,44 @@ def test_record_job_and_usage(db):
         assert job.cost_usd == 0.42 and job.clips_produced == 3
         usage = s.query(models.UsageCounter).filter_by(user_id=u).one()
         assert usage.jobs_count == 1 and usage.minutes_processed == 15.0
+
+
+# ---------------------------------------------------------------------------
+# Auth identity resolution: Clerk sub -> internal users.id
+# (the join that makes durable writes for real signed-in users actually persist)
+# ---------------------------------------------------------------------------
+
+def test_resolve_internal_user_id_creates_and_caches(db):
+    from sqlalchemy import select
+    from app.core import auth
+    from app.db import models
+
+    auth._uid_cache.clear()
+    sub = "user_2clerkXYZ"
+    uid = auth._resolve_internal_user_id(sub, {"email": "z@example.com"})
+
+    # Returns our internal users.id, NOT the raw Clerk sub — FKs reference users.id.
+    assert uid and uid != sub
+    with db_session.session_scope() as s:
+        row = s.scalar(select(models.User).where(models.User.auth_provider_id == sub))
+        assert row is not None and row.id == uid and row.email == "z@example.com"
+
+    # A durable write keyed by the resolved id persists (the previously-broken path).
+    repo.record_completed_job(job_id="job-real", user_id=uid, status="completed",
+                              cost_usd=0.1, processing_time_s=10.0, clips=1,
+                              audio_minutes=2.0)
+    with db_session.session_scope() as s:
+        assert s.get(models.ProcessingJob, "job-real") is not None
+
+    # Second call is cache-served and stable.
+    assert auth._resolve_internal_user_id(sub, {}) == uid
+    assert auth._uid_cache.get(sub) == uid
+
+
+def test_resolve_internal_user_id_passthrough_when_db_disabled(monkeypatch):
+    from app.core import auth
+    auth._uid_cache.clear()
+    monkeypatch.setattr(db_session, "_Session", None)
+    # DB off (Redis-only mode): the sub IS the id, and nothing is cached/persisted.
+    assert auth._resolve_internal_user_id("raw_sub", {"email": "a@b.com"}) == "raw_sub"
+    assert "raw_sub" not in auth._uid_cache

@@ -47,10 +47,11 @@ primary_region = "fra"          # close to the user (Central Asia → Frankfurt)
   processes = ["app"]
 
 [env]
-  APP_ENV = "development"        # smoke-test only — see header note
+  APP_ENV = "development"        # CORS still open; flip to production with the prod-hardening pass
   STORAGE_BACKEND = "local"
   STORAGE_LOCAL_DIR = "/app/storage"
-  AUTH_MODE = "none"
-  REQUIRE_CREDITS = "false"
+  AUTH_MODE = "clerk"            # every require_user endpoint now verifies a Clerk JWT
+  CLERK_JWKS_URL = "https://suitable-oryx-42.clerk.accounts.dev/.well-known/jwks.json"
+  REQUIRE_CREDITS = "false"      # keep off until signup-credit grant is wired
   PYTHONUNBUFFERED = "1"
   # OPENAI_API_KEY, REDIS_URL, CELERY_* → flyctl secrets set (never in this file)

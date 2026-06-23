@@ -132,13 +132,51 @@ async def require_user(
             )
 
         # Clerk puts the user id in `sub`. Adjust here if your IDP differs.
-        user_id = claims.get("sub")
-        if not user_id:
+        sub = claims.get("sub")
+        if not sub:
             raise HTTPException(401, "Token missing sub claim")
+        # Resolve the Clerk sub to our internal users.id, creating the row on
+        # first login. Every FK-bound durable write (processing_jobs,
+        # ledger_entries, usage_counters) references users.id — NOT the raw sub —
+        # so without this, persistence for real users would FK-violate and get
+        # silently dropped by the non-fatal write wrappers.
+        user_id = _resolve_internal_user_id(sub, claims)
         request.state.user_id = user_id
         return user_id
 
     raise RuntimeError(f"Unknown AUTH_MODE: {mode!r}")
+
+
+# sub -> internal users.id. The mapping is immutable once created, so a small
+# process-local cache keeps high-frequency calls (job-status polling) off the DB.
+_uid_cache: dict[str, str] = {}
+
+
+def _resolve_internal_user_id(sub: str, claims: dict[str, Any]) -> str:
+    """
+    Map a Clerk sub to our internal user id, upserting the user on first login.
+    Gated on db_enabled() so Redis-only mode stays DB-free (sub is the id there).
+    A transient DB error degrades gracefully to the sub rather than 401-ing the
+    whole API — the non-fatal write wrappers absorb the missing row.
+    """
+    from app.db.session import db_enabled
+    if not db_enabled():
+        return sub
+    cached = _uid_cache.get(sub)
+    if cached:
+        return cached
+    from app.db import repositories
+    # Clerk's default session token carries no email; populate it via a JWT
+    # template claim if you want it. Empty string is fine (column is NOT NULL).
+    email = claims.get("email") or claims.get("email_address") or ""
+    try:
+        internal_id = repositories.upsert_user(auth_provider_id=sub, email=email) or sub
+    except Exception as e:  # pragma: no cover - transient DB blip
+        logger.warning("user upsert failed, using sub as id: {}", e)
+        return sub
+    if len(_uid_cache) < 50_000:
+        _uid_cache[sub] = internal_id
+    return internal_id
 
 
 # Convenience: a dep that doesn't 401 but provides None for unauthenticated
