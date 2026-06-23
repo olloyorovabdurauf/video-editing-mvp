@@ -58,10 +58,31 @@ def init_engine(url: str | None = None) -> None:
         future=True,
     )
     _Session = sessionmaker(bind=_engine, expire_on_commit=False, class_=Session)
-    # Idempotent table creation. Fine for first launch; switch to Alembic
-    # migrations (see app/db/README.md) once the schema starts evolving.
-    Base.metadata.create_all(_engine)
+    _create_all_safely()
     logger.info("DB layer enabled ({} tables)", len(Base.metadata.tables))
+
+
+def _create_all_safely() -> None:
+    """
+    Create tables idempotently. The combined machine runs the API process AND
+    several Celery worker processes, each calling init_engine() — concurrent
+    create_all() races on Postgres ENUM creation (`pg_type` unique violation).
+    A transaction-level advisory lock (pgbouncer-safe; auto-released at commit)
+    serializes DDL so only one process builds the schema and the rest no-op.
+
+    DDL failure is logged, not fatal: the API must never crash-loop because of
+    a one-time schema step. (Move to Alembic migrations as the schema evolves.)
+    """
+    assert _engine is not None
+    try:
+        if _engine.dialect.name == "postgresql":
+            with _engine.begin() as conn:
+                conn.exec_driver_sql("SELECT pg_advisory_xact_lock(91273042)")
+                Base.metadata.create_all(bind=conn, checkfirst=True)
+        else:
+            Base.metadata.create_all(_engine)
+    except Exception as e:
+        logger.error("schema create_all failed (continuing; DB ops may degrade): {}", e)
 
 
 def db_enabled() -> bool:
