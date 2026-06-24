@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     openai_analysis_model: str = "gpt-4o-mini"
     openai_escalation_model: str = "gpt-4o"
     segment_cache_ttl_s: int = 7 * 24 * 3600       # re-runs of same video reuse picks
+    # Script generation is quality-sensitive (retention structure + native-language
+    # copywriting) → use the strong model. One short JSON response, so cheap.
+    openai_script_model: str = "gpt-4o"
+    script_cache_ttl_s: int = 24 * 3600
 
     # Auth — see app/core/auth.py
     auth_mode: str = "none"                       # none | clerk | custom
