@@ -43,6 +43,9 @@ export interface ReelArtifact {
   segment: Segment;
   output_url: string;
   thumbnail_url?: string | null;
+  title?: string;
+  caption?: string;
+  hashtags?: string[];
 }
 
 export interface JobResponse {

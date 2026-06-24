@@ -1,104 +1,96 @@
 "use client";
 
-import { type JobResponse, type ReelStatus } from "@/lib/api";
+import { type JobResponse } from "@/lib/api";
 
-const STAGES: { key: ReelStatus; label: string }[] = [
-  { key: "queued",            label: "Queued" },
-  { key: "downloading",       label: "Downloading" },
-  { key: "transcribing",      label: "Transcribing" },
-  { key: "analyzing",         label: "Picking segments" },
-  { key: "generating_broll",  label: "Generating b-roll" },
-  { key: "rendering",         label: "Rendering" },
-  { key: "succeeded",         label: "Done" },
+// Four user-facing AI steps, driven by overall progress so they advance smoothly
+// regardless of which internal pipeline stages run (b-roll is often skipped).
+const STEPS = [
+  { title: "Analyzing content", sub: "Transcribing & understanding the video" },
+  { title: "Finding highlights", sub: "Scoring the most viral-worthy moments" },
+  { title: "Editing clips", sub: "Cutting vertical, face-tracked clips" },
+  { title: "Adding captions", sub: "Burning captions + writing titles" },
 ];
 
+function currentStep(progress: number, succeeded: boolean): number {
+  if (succeeded) return STEPS.length;
+  if (progress < 0.25) return 0;
+  if (progress < 0.5) return 1;
+  if (progress < 0.8) return 2;
+  return 3;
+}
+
 export function JobProgress({ job }: { job: JobResponse }) {
-  const currentIdx = Math.max(0, STAGES.findIndex(s => s.key === job.status));
+  const failed = job.status === "failed";
+  const succeeded = job.status === "succeeded";
+  const idx = currentStep(job.progress, succeeded);
   const pct = Math.round(job.progress * 100);
 
   return (
     <div className="card">
-      <div className="flex items-baseline justify-between mb-4">
-        <div>
-          <div className="text-sm text-white/50">Job</div>
-          <div className="font-mono text-sm">{job.job_id}</div>
+      <div className="mb-5 flex items-center justify-between">
+        <div className="flex items-center gap-2.5">
+          {!succeeded && !failed && (
+            <span className="relative flex h-2.5 w-2.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-60" />
+              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-accent" />
+            </span>
+          )}
+          <span className="text-sm font-medium text-white">
+            {failed ? "Something went wrong" : succeeded ? "Your clips are ready" : "Creating your clips…"}
+          </span>
         </div>
-        <div className="text-right">
-          <div className="text-sm text-white/50">Progress</div>
-          <div className="text-2xl font-semibold tabular-nums">{pct}%</div>
-        </div>
+        <span className="text-sm font-semibold tabular-nums text-white/70">{pct}%</span>
       </div>
 
-      <div className="h-2 bg-white/5 rounded-full overflow-hidden">
+      {/* Progress bar */}
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/5">
         <div
-          className={`h-full transition-all duration-500 ${
-            job.status === "failed" ? "bg-red-500" : "bg-accent"
-          }`}
-          style={{ width: `${pct}%` }}
+          className={`h-full rounded-full transition-all duration-700 ${failed ? "bg-rose-500" : "bg-gradient-to-r from-accent/70 to-accent"}`}
+          style={{ width: `${Math.max(pct, failed ? 100 : 4)}%` }}
         />
       </div>
 
-      {/* On narrow screens: vertical list with full labels (no overlap). */}
-      {/* On sm+: horizontal pill row, labels under the chips. */}
-      <ol className="mt-6 sm:hidden space-y-2">
-        {STAGES.map((s, i) => {
-          const done = i < currentIdx || job.status === "succeeded";
-          const active = i === currentIdx && job.status !== "succeeded" && job.status !== "failed";
+      {/* Steps */}
+      <ol className="mt-6 space-y-3">
+        {STEPS.map((s, i) => {
+          const done = i < idx;
+          const active = i === idx && !failed;
           return (
-            <li key={s.key} className="flex items-center gap-3">
-              <div
-                className={`w-6 h-6 shrink-0 rounded-full border-2 flex items-center justify-center text-xs ${
-                  done
-                    ? "bg-accent border-accent text-white"
-                    : active
-                    ? "border-accent text-accent animate-pulse"
-                    : "border-white/15 text-white/30"
-                }`}
-              >
-                {done ? "✓" : i + 1}
-              </div>
+            <li key={s.title} className="flex items-start gap-3">
               <span
-                className={`text-sm ${done || active ? "text-white/90" : "text-white/30"}`}
-              >
-                {s.label}
-              </span>
-            </li>
-          );
-        })}
-      </ol>
-
-      <ol className="mt-6 hidden sm:grid sm:grid-cols-7 gap-2">
-        {STAGES.map((s, i) => {
-          const done = i < currentIdx || job.status === "succeeded";
-          const active = i === currentIdx && job.status !== "succeeded" && job.status !== "failed";
-          return (
-            <li key={s.key} className="text-center">
-              <div
-                className={`w-7 h-7 mx-auto rounded-full border-2 flex items-center justify-center text-xs ${
+                className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-xs transition ${
                   done
-                    ? "bg-accent border-accent text-white"
+                    ? "border-accent bg-accent text-white"
                     : active
-                    ? "border-accent text-accent animate-pulse"
+                    ? "border-accent text-accent"
                     : "border-white/15 text-white/30"
                 }`}
               >
-                {done ? "✓" : i + 1}
-              </div>
-              <div
-                className={`mt-2 text-[11px] leading-tight ${
-                  done || active ? "text-white/80" : "text-white/30"
-                }`}
-              >
-                {s.label}
+                {done ? "✓" : active ? <Spinner /> : i + 1}
+              </span>
+              <div>
+                <div className={`text-sm font-medium ${done || active ? "text-white" : "text-white/35"}`}>
+                  {s.title}
+                </div>
+                <div className={`text-xs ${active ? "text-white/50" : "text-white/25"}`}>{s.sub}</div>
               </div>
             </li>
           );
         })}
       </ol>
 
-      {job.message && (
-        <div className="mt-4 text-sm text-white/60 italic">{job.message}</div>
+      {job.message && !failed && (
+        <p className="mt-5 truncate text-xs text-white/35">{job.message}</p>
       )}
     </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <svg className="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none">
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="3" opacity="0.25" />
+      <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+    </svg>
   );
 }

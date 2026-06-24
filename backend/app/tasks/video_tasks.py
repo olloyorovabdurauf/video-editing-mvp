@@ -347,6 +347,19 @@ def t_render(self, ctx: dict) -> dict:
             broll=broll_meta,
         ))
 
+    # Generate ready-to-post title/caption/hashtags per clip. Best-effort: the
+    # clips are already rendered, so a metadata hiccup must never fail the job.
+    try:
+        from app.services import clip_metadata
+        metas = _run(clip_metadata.generate_for_clips(
+            [clip_metadata.ClipInput(transcript=a.segment.transcript, reason=a.segment.reason)
+             for a in artifacts]
+        ))
+        for a, m in zip(artifacts, metas):
+            a.title, a.caption, a.hashtags = m.title, m.caption, m.hashtags
+    except Exception as e:
+        logger.warning("clip metadata step skipped: {}", e)
+
     # Settle credits — refund the over-estimate, charge any overage.
     job_state = json.loads(r.get(_key(ctx["job_id"])) or "{}")
     if job_state.get("credit_hold_id") and job_state.get("user_id") not in (None, "anonymous"):

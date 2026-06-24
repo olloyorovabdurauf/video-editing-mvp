@@ -2,217 +2,182 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { createReel, type AspectRatio, type CaptionStyle } from "@/lib/api";
+import { SignInButton, useAuth } from "@clerk/nextjs";
+import { ApiError, createReel } from "@/lib/api";
+
+const CLIP_COUNTS = [3, 5, 8];
+
+const HOW_IT_WORKS = [
+  { icon: "🎧", title: "Analyzes", desc: "Transcribes & understands the whole video" },
+  { icon: "✨", title: "Finds highlights", desc: "Scores the most viral-worthy moments" },
+  { icon: "✂️", title: "Edits clips", desc: "Cuts vertical, face-tracked short clips" },
+  { icon: "💬", title: "Captions", desc: "Burns captions + writes titles & captions" },
+];
+
+function friendlyError(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.status === 401) return "Please sign in to create clips.";
+    if (e.status === 402) return "You're out of credits. Top up to keep creating.";
+    if (e.status === 429) return "A little too fast — give it a moment and try again.";
+    if (e.status === 400) return "That link doesn't look right. Paste a public video URL.";
+    return e.message || "Something went wrong. Please try again.";
+  }
+  return "Network hiccup — check your connection and try again.";
+}
 
 export default function HomePage() {
   const router = useRouter();
-  const [sourceUrl, setSourceUrl] = useState("");
-  const [aspect, setAspect] = useState<AspectRatio>("9:16");
+  const { isSignedIn } = useAuth();
+
+  const [url, setUrl] = useState("");
   const [count, setCount] = useState(3);
-  const [maxDur, setMaxDur] = useState(45);
-  const [prompt, setPrompt] = useState("");
-  const [captionStyle, setCaptionStyle] = useState<CaptionStyle>("karaoke");
-  const [smartCrop, setSmartCrop] = useState(true);
-  const [useAi, setUseAi] = useState(false);   // premium opt-in
-  const [budget, setBudget] = useState(4);
+  const [captions, setCaptions] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const looksValid = /^https?:\/\/.+\..+/.test(url.trim());
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!looksValid) {
+      setError("Paste a full video link (e.g. https://youtube.com/watch?v=…).");
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
       const job = await createReel({
-        source_url: sourceUrl,
-        aspect,
+        source_url: url.trim(),
+        aspect: "9:16",
         target_count: count,
-        max_duration_s: maxDur,
-        caption_style: captionStyle,
-        smart_crop: smartCrop,
+        max_duration_s: 60,
+        caption_style: captions ? "karaoke" : "none",
+        smart_crop: true,
         add_broll: true,
         add_music: true,
-        use_ai_broll: useAi,
-        ai_broll_budget_usd: budget,
-        prompt: prompt || undefined,
+        use_ai_broll: false,
+        ai_broll_budget_usd: 0,
       });
       router.push(`/jobs/${job.job_id}`);
-    } catch (err: any) {
-      setError(err.message || "Submission failed");
+    } catch (err) {
+      setError(friendlyError(err));
       setSubmitting(false);
     }
   }
 
   return (
-    <div className="grid lg:grid-cols-5 gap-8">
-      <section className="lg:col-span-3">
-        <h1 className="text-3xl font-semibold tracking-tight mb-2">
-          Turn a long video into reels — automatically.
+    <div className="mx-auto max-w-2xl">
+      {/* Hero */}
+      <div className="mb-8 text-center sm:mb-10">
+        <span className="inline-block rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-white/50">
+          AI video repurposing
+        </span>
+        <h1 className="mt-4 text-3xl font-semibold tracking-tight text-white sm:text-5xl">
+          Turn long videos into{" "}
+          <span className="bg-gradient-to-r from-accent to-violet-300 bg-clip-text text-transparent">
+            viral short clips
+          </span>
         </h1>
-        <p className="text-white/60 mb-8 leading-relaxed">
-          Paste a YouTube URL. We transcribe it, find the most hook-worthy
-          moments, generate cinematic AI b-roll, sync captions, and ship MP4s.
+        <p className="mx-auto mt-3 max-w-lg text-sm text-white/50 sm:text-base">
+          Paste a YouTube link. Our AI finds the best moments and edits them into
+          ready-to-post clips — captions, titles and all.
         </p>
+      </div>
 
-        <form onSubmit={onSubmit} className="card space-y-6">
-          <div>
-            <label className="label">Source video</label>
+      {/* Input card */}
+      <form onSubmit={onSubmit} className="card space-y-5">
+        <div>
+          <label htmlFor="url" className="label">
+            YouTube video URL
+          </label>
+          <div className="relative">
+            <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-white/30">
+              <YoutubeIcon />
+            </span>
             <input
-              required
+              id="url"
               type="url"
-              className="input"
-              placeholder="https://youtube.com/watch?v=..."
-              value={sourceUrl}
-              onChange={(e) => setSourceUrl(e.target.value)}
+              inputMode="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://youtube.com/watch?v=…"
+              className="input py-4 pl-11 text-base"
             />
           </div>
+        </div>
 
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className="label">Aspect</label>
-              <select
-                className="input"
-                value={aspect}
-                onChange={(e) => setAspect(e.target.value as AspectRatio)}
-              >
-                <option value="9:16">9:16 — Reels / Shorts</option>
-                <option value="16:9">16:9 — YouTube</option>
-                <option value="1:1">1:1 — Square</option>
-              </select>
-            </div>
-            <div>
-              <label className="label">Reels to extract</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                className="input"
-                value={count}
-                onChange={(e) => setCount(parseInt(e.target.value) || 1)}
-              />
-            </div>
-            <div>
-              <label className="label">Max length (s)</label>
-              <input
-                type="number"
-                min={10}
-                max={180}
-                className="input"
-                value={maxDur}
-                onChange={(e) => setMaxDur(parseInt(e.target.value) || 45)}
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="label">Caption style</label>
-              <select
-                className="input"
-                value={captionStyle}
-                onChange={(e) => setCaptionStyle(e.target.value as CaptionStyle)}
-              >
-                <option value="karaoke">Karaoke — word lights up as spoken</option>
-                <option value="popup">Pop-up — one word at a time</option>
-                <option value="minimal">Minimal — clean &amp; subtle</option>
-                <option value="none">None</option>
-              </select>
-            </div>
-            <div className="flex items-end">
-              <label className="flex items-center gap-2 text-sm cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={smartCrop}
-                  onChange={(e) => setSmartCrop(e.target.checked)}
-                  className="accent-accent"
-                />
-                <span>
-                  <span className="font-medium">Smart crop</span>
-                  <span className="block text-white/40 text-xs">
-                    Face-tracking pan &amp; scan (vs center)
-                  </span>
-                </span>
-              </label>
-            </div>
-          </div>
-
+        {/* Minimal options */}
+        <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
           <div>
-            <label className="label">Creative directive (optional)</label>
-            <textarea
-              className="input min-h-[80px]"
-              placeholder="focus on contrarian moments; keep energy high; cut around any filler words"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+            <span className="label">Clips</span>
+            <div className="flex gap-2">
+              {CLIP_COUNTS.map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setCount(n)}
+                  className={`h-9 w-11 rounded-lg border text-sm font-medium transition active:scale-95 ${
+                    count === n
+                      ? "border-accent/60 bg-accent/15 text-white"
+                      : "border-white/10 bg-white/[0.03] text-white/60 hover:text-white"
+                  }`}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="flex h-9 cursor-pointer select-none items-center gap-2 text-sm text-white/70">
+            <input
+              type="checkbox"
+              checked={captions}
+              onChange={(e) => setCaptions(e.target.checked)}
+              className="h-4 w-4 accent-accent"
             />
-          </div>
+            Burn captions
+          </label>
+        </div>
 
-          <div className="border-t border-white/5 pt-6">
-            <div className="flex items-start gap-3 mb-4">
-              <input
-                id="ai"
-                type="checkbox"
-                checked={useAi}
-                onChange={(e) => setUseAi(e.target.checked)}
-                className="mt-1 accent-accent"
-              />
-              <label htmlFor="ai" className="text-sm">
-                <span className="font-medium">
-                  Generate AI b-roll
-                  <span className="ml-2 px-2 py-0.5 text-[10px] rounded-full bg-accent/20 text-accent uppercase tracking-wider">
-                    Premium
-                  </span>
-                </span>
-                <span className="block text-white/50">
-                  Cinematic, custom-prompted shots. ~$0.50/clip. Off by default;
-                  stock b-roll covers most cases for free.
-                </span>
-              </label>
-            </div>
-            {useAi && (
-              <div>
-                <label className="label">Budget cap (USD)</label>
-                <input
-                  type="number"
-                  min={0}
-                  max={20}
-                  step={0.5}
-                  className="input"
-                  value={budget}
-                  onChange={(e) => setBudget(parseFloat(e.target.value) || 0)}
-                />
-              </div>
-            )}
-          </div>
+        {error && <p className="text-sm text-rose-300">{error}</p>}
 
-          {error && (
-            <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-4 py-3">
-              {error}
-            </div>
-          )}
-
-          <button type="submit" className="btn-primary w-full" disabled={submitting}>
-            {submitting ? "Submitting…" : "Generate reels"}
+        {isSignedIn === false ? (
+          <SignInButton mode="modal">
+            <button type="button" className="btn-primary w-full py-4 text-base">
+              Sign in to create clips →
+            </button>
+          </SignInButton>
+        ) : (
+          <button
+            type="submit"
+            disabled={submitting || !looksValid}
+            className="btn-primary w-full py-4 text-base"
+          >
+            {submitting ? "Starting…" : "✦ Create Clips"}
           </button>
-        </form>
-      </section>
+        )}
+        <p className="text-center text-xs text-white/30">
+          Works with podcasts, interviews, talks and any long-form video.
+        </p>
+      </form>
 
-      <aside className="lg:col-span-2 space-y-4">
-        <div className="card">
-          <h2 className="font-medium mb-3">The pipeline</h2>
-          <ol className="text-sm text-white/70 space-y-2">
-            <li><span className="text-accent">1.</span> Download &amp; transcribe (Whisper)</li>
-            <li><span className="text-accent">2.</span> Pick viral segments (GPT-4o)</li>
-            <li><span className="text-accent">3.</span> Plan b-roll insertions</li>
-            <li><span className="text-accent">4.</span> Generate b-roll (Runway / Higgsfield)</li>
-            <li><span className="text-accent">5.</span> Reframe, composite, caption, mix</li>
-          </ol>
-        </div>
-        <div className="card text-xs text-white/50 leading-relaxed">
-          Generation runs in parallel across all insertion points.
-          Typical job: <span className="text-white/80">2–4 min</span> end to end,
-          dominated by AI b-roll inference (~60–120s/clip).
-        </div>
-      </aside>
+      {/* How it works */}
+      <div className="mt-8 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        {HOW_IT_WORKS.map((s) => (
+          <div key={s.title} className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+            <div className="text-xl">{s.icon}</div>
+            <div className="mt-2 text-sm font-medium text-white">{s.title}</div>
+            <div className="mt-0.5 text-xs leading-snug text-white/40">{s.desc}</div>
+          </div>
+        ))}
+      </div>
     </div>
+  );
+}
+
+function YoutubeIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M23 12s0-3.2-.4-4.7a2.5 2.5 0 0 0-1.8-1.8C19.3 5 12 5 12 5s-7.3 0-8.8.5A2.5 2.5 0 0 0 1.4 7.3C1 8.8 1 12 1 12s0 3.2.4 4.7a2.5 2.5 0 0 0 1.8 1.8C4.7 19 12 19 12 19s7.3 0 8.8-.5a2.5 2.5 0 0 0 1.8-1.8C23 15.2 23 12 23 12ZM9.8 15.3V8.7l6.2 3.3-6.2 3.3Z" />
+    </svg>
   );
 }

@@ -20,15 +20,12 @@ function Shell({ children }: { children: React.ReactNode }) {
       <body className="min-h-screen">
         <header className="border-b border-white/5">
           <div className="max-w-5xl mx-auto px-6 py-5 flex items-center justify-between">
-            <a href="/studio" className="text-lg font-semibold tracking-tight">
+            <a href="/" className="text-lg font-semibold tracking-tight">
               <span className="text-accent">▸</span> Reel Forge
             </a>
             <nav className="text-sm text-white/50 flex items-center gap-3 sm:gap-4">
-              <a className="hover:text-white transition" href="/studio">
-                Studio
-              </a>
-              <a className="hidden sm:inline hover:text-white transition" href="/">
-                Reels
+              <a className="hidden sm:inline hover:text-white transition" href="/studio">
+                Scripts
               </a>
               {clerkKey ? (
                 <>

@@ -103,6 +103,11 @@ class ReelArtifact(BaseModel):
     output_url: HttpUrl | str
     thumbnail_url: HttpUrl | str | None = None
     broll: list[BRollClip] = []
+    # AI-generated, ready-to-post metadata for this clip (best-effort; empty if
+    # generation fails). Produced in the source video's language.
+    title: str = ""
+    caption: str = ""
+    hashtags: list[str] = []
 
 
 class ReelJobStatus(str, Enum):

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
+import Link from "next/link";
 import { getJob, type JobResponse } from "@/lib/api";
 import { JobProgress } from "@/components/JobProgress";
 import { ReelCard } from "@/components/ReelCard";
@@ -41,37 +42,60 @@ export default function JobPage() {
   }, [id]);
 
   if (error && !job) {
-    return <div className="text-red-400">Error: {error}</div>;
+    return (
+      <div className="mx-auto max-w-2xl">
+        <div className="card border-rose-500/30 bg-rose-500/5 text-center text-sm text-rose-300">
+          {error}
+        </div>
+      </div>
+    );
   }
   if (!job) {
-    return <div className="text-white/50">Loading job…</div>;
+    return <div className="mx-auto max-w-2xl text-center text-sm text-white/40">Loading…</div>;
   }
 
+  const done = job.status === "succeeded";
+
   return (
-    <div className="space-y-8">
-      <JobProgress job={job} />
+    <div className="mx-auto max-w-5xl space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold text-white sm:text-2xl">
+          {done ? "Your clips" : "Creating your clips"}
+        </h1>
+        <Link
+          href="/"
+          className="rounded-lg border border-white/10 px-3 py-2 text-xs font-medium text-white/70
+            transition hover:border-white/20 hover:text-white"
+        >
+          ＋ New video
+        </Link>
+      </div>
+
+      {/* Show progress until clips arrive */}
+      {(!done || job.artifacts.length === 0) && (
+        <div className="mx-auto max-w-2xl">
+          <JobProgress job={job} />
+        </div>
+      )}
 
       {job.status === "failed" && (
-        <div className="card border-red-500/30 bg-red-500/5">
-          <h3 className="text-red-400 font-medium mb-2">Job failed</h3>
-          <p className="text-sm text-white/70">{job.message || "Unknown error"}</p>
+        <div className="mx-auto max-w-2xl">
+          <div className="card border-rose-500/30 bg-rose-500/5">
+            <p className="text-sm font-medium text-rose-300">
+              {job.message || "This video couldn't be processed. Try another link."}
+            </p>
+            <Link href="/" className="mt-3 inline-block text-xs text-white/70 underline hover:text-white">
+              Try another video
+            </Link>
+          </div>
         </div>
       )}
 
       {job.artifacts.length > 0 && (
-        <section>
-          <h2 className="text-xl font-semibold mb-4">Generated reels</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {job.artifacts.map((reel, i) => (
-              <ReelCard key={i} reel={reel} index={i} />
-            ))}
-          </div>
-        </section>
-      )}
-
-      {job.status !== "succeeded" && job.status !== "failed" && job.artifacts.length === 0 && (
-        <div className="text-center text-white/40 text-sm py-10">
-          Reels will appear here as they finish rendering.
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {job.artifacts.map((reel, i) => (
+            <ReelCard key={i} reel={reel} index={i} />
+          ))}
         </div>
       )}
     </div>
