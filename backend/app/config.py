@@ -106,6 +106,12 @@ class Settings(BaseSettings):
     ffprobe_binary: str = "ffprobe"
     ffmpeg_threads: int = 0
     ffmpeg_hwaccel: str = ""
+    # x264 speed/size trade-off, applied to every re-encode pass (cut, reframe,
+    # smart-crop, b-roll overlay, caption burn). superfast ≈ 1.5x faster than
+    # veryfast at the same CRF/quality, for ~moderately larger files — the right
+    # call for short social reels where render latency matters more than bytes.
+    # Drop to "ultrafast" for max speed, or "veryfast"/"faster" for smaller files.
+    ffmpeg_preset: str = "superfast"
 
     @property
     def is_prod(self) -> bool:

@@ -30,6 +30,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from app.config import get_settings
 from app.utils import ffmpeg as ff
 from app.utils.ffmpeg import FFmpegCommand, run
 
@@ -192,7 +193,7 @@ async def smart_crop_to_vertical(
         .add_input(src)
         .with_filter_complex(filt)
         .add_output_args(
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", str(crf),
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
         )

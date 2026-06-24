@@ -376,7 +376,7 @@ async def cut(
         .with_output(dst)
     )
     if reencode:
-        builder.add_output_args("-c:v", "libx264", "-preset", "veryfast",
+        builder.add_output_args("-c:v", "libx264", "-preset", get_settings().ffmpeg_preset,
                                 "-crf", "20", "-c:a", "aac", "-b:a", "128k")
     else:
         builder.add_output_args("-c", "copy", "-avoid_negative_ts", "make_zero")
@@ -408,7 +408,7 @@ async def reframe_to_vertical(
         .add_input(src)
         .with_filter_complex(filt)
         .add_output_args(
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", str(crf),
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
         )
@@ -466,7 +466,7 @@ async def overlay_broll(
         .with_filter_complex(filt)
         .add_output_args(
             "-map", "[v]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", "20",
             "-c:a", "copy",
         )
         .with_output(dst)
@@ -523,7 +523,7 @@ async def overlay_with_dissolve(
         .with_filter_complex(filt)
         .add_output_args(
             "-map", "[v]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", "20",
             "-c:a", "copy",
         )
         .with_output(dst)
@@ -546,7 +546,7 @@ async def burn_ass(src: Path, ass: Path, dst: Path) -> Path:
         .add_input(src)
         .with_filter_complex(filt)
         .add_output_args(
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", "20",
             "-c:a", "copy",
         )
         .with_output(dst)
