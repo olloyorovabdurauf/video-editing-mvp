@@ -121,6 +121,101 @@ export async function createReel(body: ReelCreateRequest): Promise<JobResponse> 
   return r.json();
 }
 
+// ---------------------------------------------------------------------------
+// Script generation (text product). Keep shapes in sync with
+// backend/app/schemas/script.py.
+// ---------------------------------------------------------------------------
+
+export type ScriptLanguage = "uz" | "en" | "ru";
+export type ContentType =
+  | "educational"
+  | "personal_brand"
+  | "founder_story"
+  | "product_marketing"
+  | "storytelling"
+  | "tutorial"
+  | "sales"
+  | "viral_reel";
+export type Industry =
+  | "general" | "business" | "health" | "education" | "finance" | "technology" | "other";
+
+export interface ScriptGenerateRequest {
+  topic?: string;
+  language: ScriptLanguage;
+  content_type: ContentType;
+  industry: Industry;
+  duration_seconds: number;
+}
+
+export interface ScriptSection {
+  name: "hook" | "problem" | "value" | "payoff";
+  start_s: number;
+  end_s: number;
+  voiceover: string;
+  visual: string;
+  time_range: string;
+}
+
+export interface ScriptCaption {
+  hook: string;
+  body: string;
+  cta: string;
+}
+
+export interface ScriptResponse {
+  title: string;
+  hook: string;
+  script: string;
+  sections: ScriptSection[];
+  caption: ScriptCaption;
+  hashtags: string[];
+  language: ScriptLanguage;
+  content_type: ContentType;
+  industry: Industry;
+  duration_seconds: number;
+  formatted: string;
+}
+
+export async function createScript(body: ScriptGenerateRequest): Promise<ScriptResponse> {
+  const r = await fetch("/api/v1/scripts", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(await authHeaders()) },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let detail = "";
+    try {
+      detail = (await r.json())?.detail ?? "";
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new ApiError(r.status, detail || `Request failed (${r.status})`);
+  }
+  return r.json();
+}
+
+export interface Balance {
+  user_id: string;
+  balance: number;
+}
+
+export async function getBalance(): Promise<Balance> {
+  const r = await fetch("/api/v1/billing/balance", {
+    cache: "no-store",
+    headers: await authHeaders(),
+  });
+  if (!r.ok) throw new ApiError(r.status, `balance failed (${r.status})`);
+  return r.json();
+}
+
+/** Typed error so the UI can show friendly, status-aware messages. */
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export async function getJob(id: string): Promise<JobResponse> {
   if (DEMO) {
     let startedAt = parseInt(sessionStorage.getItem(`${DEMO_START_KEY}:${id}`) || "0");

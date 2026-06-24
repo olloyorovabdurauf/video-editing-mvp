@@ -1,11 +1,15 @@
 """
 Schemas for AI Reels *script* generation.
 
-This is a text product, separate from the video-clip pipeline: given a topic +
-language + style, we generate a full, retention-engineered Reels script (not a
-clip cut from existing footage). Every script follows a fixed 4-part structure
-(hook → problem → value → payoff+CTA) sized for 40-60s so the idea is fully
-developed and the hook's promise is always paid off.
+A text product, separate from the video-clip pipeline: given a topic + language
++ content type + industry, we generate a complete, retention-engineered Reels
+script (40-60s; 30s allowed for punchy formats) following a fixed arc
+(hook → problem → value → payoff+CTA) so the idea is fully developed and the
+hook's promise is always paid off.
+
+The product is for creators, experts, educators, coaches, businesses and
+marketers — NOT only founders. Voice/goal/tone adapt to the selected content
+type; founder/build-in-public is just one option, used only when chosen.
 """
 from __future__ import annotations
 
@@ -21,11 +25,26 @@ class ScriptLanguage(str, Enum):
     UZ = "uz"
 
 
-class ScriptStyle(str, Enum):
-    # Founder / build-in-public: journey, AI future, startup lessons, product building.
-    FOUNDER = "founder_building_in_public"
-    # Educational: problem → insight → framework → example.
+class ContentType(str, Enum):
+    """What kind of reel — drives voice, goal, audience framing and tone."""
     EDUCATIONAL = "educational"
+    PERSONAL_BRAND = "personal_brand"
+    FOUNDER_STORY = "founder_story"          # build-in-public — only when selected
+    PRODUCT_MARKETING = "product_marketing"
+    STORYTELLING = "storytelling"
+    TUTORIAL = "tutorial"
+    SALES = "sales"
+    VIRAL_REEL = "viral_reel"
+
+
+class Industry(str, Enum):
+    GENERAL = "general"
+    BUSINESS = "business"
+    HEALTH = "health"
+    EDUCATION = "education"
+    FINANCE = "finance"
+    TECHNOLOGY = "technology"
+    OTHER = "other"
 
 
 # The mandatory retention skeleton. Order + presence are validated.
@@ -39,21 +58,22 @@ class ScriptGenerateRequest(BaseModel):
     topic: str | None = Field(
         default=None, max_length=400,
         description="What the reel is about. If omitted, the model proposes a "
-                    "strong on-brand topic for the niche/style.",
+                    "strong, specific topic for the content type + industry.",
     )
     language: ScriptLanguage = ScriptLanguage.UZ
-    style: ScriptStyle = ScriptStyle.FOUNDER
+    content_type: ContentType = ContentType.EDUCATIONAL   # NOT founder by default
+    industry: Industry = Industry.GENERAL
     duration_seconds: int = Field(
-        default=60, ge=40, le=75,
-        description="Target length. Hard floor 40s so the idea is fully developed "
-                    "— the fix for thin 15s reels with no payoff.",
+        default=60, ge=30, le=75,
+        description="Target length (30/45/60). The script is sized to genuinely "
+                    "fill it — the fix for thin reels with no payoff.",
     )
+    # Optional overrides. When empty, the model infers them from content type +
+    # industry + topic so every reel still matches a clear goal/audience/tone.
+    audience: str | None = Field(default=None, max_length=200)
+    goal: str | None = Field(default=None, max_length=200)
+    tone: str | None = Field(default=None, max_length=120)
     platform: str = Field(default="instagram_reels")
-    niche: str = Field(
-        default="AI video editing / short-form content startup",
-        max_length=200,
-        description="Context used for relevance and for inventing a topic when none is given.",
-    )
     # Clients may send a user_id; the auth token overrides it in the endpoint.
     user_id: str | None = None
 
@@ -98,7 +118,8 @@ class ScriptResponse(BaseModel):
     caption: Caption
     hashtags: list[str] = Field(default_factory=list)
     language: ScriptLanguage
-    style: ScriptStyle
+    content_type: ContentType
+    industry: Industry
     duration_seconds: int
 
     @computed_field  # type: ignore[prop-decorator]

@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import { ClerkProvider } from "@clerk/nextjs";
 import { AuthBridge } from "@/components/AuthBridge";
 import { AuthButtons } from "@/components/AuthButtons";
+import { CreditsBadge } from "@/components/CreditsBadge";
 
 export const metadata: Metadata = {
   title: "Reel Forge — AI Video Editor",
@@ -19,12 +20,21 @@ function Shell({ children }: { children: React.ReactNode }) {
       <body className="min-h-screen">
         <header className="border-b border-white/5">
           <div className="max-w-5xl mx-auto px-6 py-5 flex items-center justify-between">
-            <a href="/" className="text-lg font-semibold tracking-tight">
+            <a href="/studio" className="text-lg font-semibold tracking-tight">
               <span className="text-accent">▸</span> Reel Forge
             </a>
-            <nav className="text-sm text-white/50 flex items-center gap-4">
+            <nav className="text-sm text-white/50 flex items-center gap-3 sm:gap-4">
+              <a className="hover:text-white transition" href="/studio">
+                Studio
+              </a>
+              <a className="hidden sm:inline hover:text-white transition" href="/">
+                Reels
+              </a>
               {clerkKey ? (
-                <AuthButtons />
+                <>
+                  <CreditsBadge />
+                  <AuthButtons />
+                </>
               ) : (
                 <a className="hover:text-white transition" href="/api/v1/docs" target="_blank">
                   API docs
