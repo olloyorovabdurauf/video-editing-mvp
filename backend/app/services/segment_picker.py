@@ -47,16 +47,25 @@ Find {n} DISTINCT complete clips spread across DIFFERENT parts of the video
 - Begin at the START of a thought (a sentence boundary), never mid-sentence.
 - End on a finished thought — never mid-sentence, never on "...and that's why".
 
-Do NOT select on emotional words, controversy, or energy alone. Ask: does this
-section have a clear beginning, explain a full idea, deliver value, and end
-satisfyingly? Could it stand alone as a Reel?
+Do NOT select on emotional words, controversy, or energy alone. You are doing
+STORY-BOUNDARY DETECTION: find where a complete thought BEGINS and ENDS. For
+every candidate run this checklist:
+  1. Opening clarity — do the first 3-5s make sense with NO prior context?
+  2. Context        — will the viewer understand what's being discussed?
+  3. Main idea      — is the FULL explanation/story inside the clip?
+  4. Resolution     — does the speaker actually finish the thought (not cut off)?
+  5. Standalone     — posted on its own, does it deliver a complete idea?
+THE TEST: "If a viewer watches ONLY this clip and nothing else, will they fully
+understand the idea?" If no, do not return it. Move the start earlier to capture
+the setup, or the end later to capture the payoff — never start mid-thought or
+end on "...and that's why".
 
 For EACH clip score 0..1:
-  hook_score          strength of the opening
-  value_score         how much insight/value the body delivers
-  completeness_score  does it stand alone as a full idea with a clear beginning,
-                      middle and end? THIS MATTERS MOST.
-  payoff_score        how resolved/satisfying the ending is
+  hook_score          strength of the opening (criterion 1)
+  value_score         how much insight/value the body delivers (criterion 3)
+  completeness_score  the STANDALONE score (criteria 2+5): does it stand fully
+                      on its own with a clear beginning, middle and end? MOST IMPORTANT.
+  payoff_score        how resolved/finished the ending is (criterion 4)
 Only return clips with completeness_score >= 0.6. If the video has fewer than
 {n} genuinely complete clips, return FEWER — never pad with fragments.
 

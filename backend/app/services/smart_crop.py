@@ -1,30 +1,32 @@
 """
-Speaker-tracking smart crop.
+Speaker-tracking smart crop (16:9 → 9:16).
 
-Naive vertical reframe (`crop=W:H:(iw-W)/2:(ih-H)/2`) is the #1 reason
-auto-cropped reels look amateurish: the talker walks/turns and exits frame.
+Naive center-crop is the #1 reason auto-reels look amateurish: the talker turns
+or sits off-centre and gets half-cropped. We track the active speaker's face and
+pan the crop window to keep them framed, like a human editor would.
 
-What we do
-----------
-1. Sample the source at 2 fps with OpenCV.
-2. Detect the largest face per sample using MediaPipe FaceDetection.
-3. Build a smoothed (x, y) trajectory of where the *content* lives.
-4. Emit a SINGLE ffmpeg filter pass whose `crop` expression evaluates the
-   trajectory over time via chained `if(between(t, ...))` clauses.
+How it works
+------------
+1. Sample the clip at ~1.5 fps, reading FRAMES SEQUENTIALLY (grab/skip) — never
+   seeking per sample, which is slow and flaky.
+2. Detect the largest face per sample (MediaPipe).
+3. Smooth the trajectory (EMA) so the camera glides, never jitters.
+4. Down-sample to at most ~20 keyframes and emit ONE ffmpeg `crop` pass whose x
+   position interpolates between them. If the speaker barely moves, emit a single
+   CONSTANT crop instead — cleaner and bullet-proof.
 
-That last point is the trick: one ffmpeg pass, no per-frame Python work,
-no temp files, and the encoder doesn't run twice. Smooth pan + scan in
-~realtime-ish on a CPU worker.
+Why the keyframe cap matters
+----------------------------
+The old version emitted one `if()` per sample (90-120 for a 60s clip), which
+overflowed ffmpeg's expression parser → "Error reinitializing filters" and the
+clip fell back to center-crop. Capping at ~20 keyframes keeps the expression
+small and reliable while still tracking the speaker smoothly.
 
-Graceful degradation
---------------------
-If mediapipe / opencv aren't installed, we fall back to center-crop — the
-pipeline still produces output, just less polished. The hard import is
-inside the function so a missing dep doesn't break the rest of the app.
+Graceful degradation: if mediapipe/opencv are missing or no face is found, the
+caller center-crops. Imports are local so a missing dep never breaks the app.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,113 +36,122 @@ from app.config import get_settings
 from app.utils import ffmpeg as ff
 from app.utils.ffmpeg import FFmpegCommand, run
 
+# Tracking/quality knobs.
+_SAMPLE_FPS = 1.5        # face samples per second — enough to track a talking head
+_MAX_KEYFRAMES = 20      # hard cap on crop-expression keyframes (ffmpeg-safe)
+_EMA_ALPHA = 0.4         # trajectory smoothing (lower = smoother/slower camera)
+
 
 @dataclass
 class FaceTrack:
-    """Smoothed (t, cx, cy) keypoints in SOURCE-pixel coordinates."""
+    """(t, cx, cy) face-centre keypoints in SOURCE-pixel coordinates."""
     t: list[float]
     cx: list[float]
     cy: list[float]
 
 
 def _sample_faces(src: Path, *, sample_fps: float) -> FaceTrack | None:
-    """OpenCV + MediaPipe at sample_fps. Returns None if libs missing or no face."""
+    """MediaPipe face centres sampled sequentially. None if libs missing / no face."""
     try:
         import cv2                                          # type: ignore
         import mediapipe as mp                              # type: ignore
     except ImportError:
-        logger.warning("mediapipe/opencv not installed; smart crop will fall back to center")
+        logger.warning("mediapipe/opencv not installed; smart crop falls back to center")
         return None
 
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
         return None
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if total_frames == 0:
-        cap.release()
-        return None
-
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     step = max(1, int(round(src_fps / sample_fps)))
     detector = mp.solutions.face_detection.FaceDetection(
-        model_selection=1, min_detection_confidence=0.5,
-    )
+        model_selection=1, min_detection_confidence=0.5)
 
     ts: list[float] = []
     xs: list[float] = []
     ys: list[float] = []
+    idx = 0
+    try:
+        while True:
+            ok = cap.grab()                                 # cheap: no decode
+            if not ok:
+                break
+            if idx % step == 0:
+                ok, frame = cap.retrieve()                  # decode only sampled frames
+                if ok and frame is not None:
+                    h, w = frame.shape[:2]
+                    res = detector.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    if res.detections:
+                        best = max(res.detections,
+                                   key=lambda d: d.location_data.relative_bounding_box.width
+                                   * d.location_data.relative_bounding_box.height)
+                        box = best.location_data.relative_bounding_box
+                        ts.append(idx / src_fps)
+                        xs.append((box.xmin + box.width / 2) * w)
+                        ys.append((box.ymin + box.height / 2) * h)
+            idx += 1
+    finally:
+        cap.release()
+        detector.close()
 
-    for frame_idx in range(0, total_frames, step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        h, w = frame.shape[:2]
-        results = detector.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        t = frame_idx / src_fps
-        if not results.detections:
-            # No face — fall back to centroid; will be ignored if no other samples land near it
-            continue
-        # Largest face = highest area
-        best = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width
-                                                    * d.location_data.relative_bounding_box.height)
-        box = best.location_data.relative_bounding_box
-        cx = (box.xmin + box.width / 2) * w
-        cy = (box.ymin + box.height / 2) * h
-        ts.append(t)
-        xs.append(cx)
-        ys.append(cy)
-
-    cap.release()
-    detector.close()
     if len(ts) < 2:
         return None
     return FaceTrack(t=ts, cx=xs, cy=ys)
 
 
-def _smooth(values: list[float], window: int = 5) -> list[float]:
-    """Symmetric moving average — removes jitter without introducing lag."""
-    if window <= 1 or len(values) <= 1:
-        return values[:]
-    out: list[float] = []
-    half = window // 2
-    for i in range(len(values)):
-        lo, hi = max(0, i - half), min(len(values), i + half + 1)
-        out.append(sum(values[lo:hi]) / (hi - lo))
-    return out
+def _ema(values: list[float], alpha: float = _EMA_ALPHA) -> list[float]:
+    """Exponential moving average — a gliding camera, no jitter, minimal lag."""
+    if not values:
+        return values
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(alpha * v + (1 - alpha) * out[-1])
+    # second (reverse) pass cancels the EMA's lag so motion stays centred on the face
+    rev = [out[-1]]
+    for v in reversed(out[:-1]):
+        rev.append(alpha * v + (1 - alpha) * rev[-1])
+    rev.reverse()
+    return rev
 
 
-def _build_crop_expr(samples: FaceTrack, *, src_dim: int, crop_dim: int, axis: str) -> str:
+def _downsample(times: list[float], values: list[float], k: int) -> tuple[list[float], list[float]]:
+    """Evenly pick at most k (t, value) keyframes."""
+    n = len(times)
+    if n <= k:
+        return times, values
+    idx = [round(i * (n - 1) / (k - 1)) for i in range(k)]
+    return [times[i] for i in idx], [values[i] for i in idx]
+
+
+def _crop_origin_expr(times: list[float], centers: list[float], *,
+                      src_dim: int, crop_dim: int) -> str:
     """
-    Build an ffmpeg expression evaluating the smoothed track over time.
+    ffmpeg expression for the crop window's top-left origin along one axis.
 
-    The output is the TOP-LEFT corner of the crop window, clamped so the
-    crop stays inside the source frame. Format:
-
-        if(lt(t, t1), v1, if(lt(t, t2), v2 + lerp..., ...))
-
-    For ~30 keyframes this expression is ~600 chars; ffmpeg parses it once,
-    evaluates per frame, no measurable overhead.
+    Centres the window on the (smoothed) face and clamps it inside the frame so
+    the face is never half-cut. Emits a CONSTANT when the speaker is ~static
+    (most podcasts), else a short piecewise-linear interpolation (<= _MAX_KEYFRAMES).
     """
-    centers_raw = samples.cx if axis == "x" else samples.cy
-    centers = _smooth(centers_raw, window=5)
-    times = samples.t
-
     half = crop_dim / 2
     max_origin = max(0, src_dim - crop_dim)
 
-    def clamp(c: float) -> float:
-        return max(0.0, min(c - half, max_origin))
+    def clamp(c: float) -> int:
+        return int(round(max(0.0, min(c - half, float(max_origin)))))
 
-    # Build piecewise-linear expression: for each pair of keyframes,
-    # linearly interpolate between clamped(center_i) and clamped(center_{i+1}).
-    expr = f"{clamp(centers[-1]):.1f}"  # default after last keyframe
+    times, centers = _downsample(times, _ema(centers), _MAX_KEYFRAMES)
+    vals = [clamp(c) for c in centers]
+
+    # Static shot (or no room to pan) → single constant origin: clean + reliable.
+    if max_origin == 0 or (max(vals) - min(vals)) <= max(2, int(0.02 * crop_dim)):
+        return str(round(sum(vals) / len(vals)))
+
+    expr = f"{vals[-1]}"
     for i in range(len(times) - 2, -1, -1):
         t0, t1 = times[i], times[i + 1]
-        v0, v1 = clamp(centers[i]), clamp(centers[i + 1])
+        v0, v1 = vals[i], vals[i + 1]
         slope = (v1 - v0) / max(0.0001, (t1 - t0))
-        lerp = f"({v0:.1f}+({slope:.3f})*(t-{t0:.3f}))"
-        expr = f"if(lt(t\\,{t1:.3f})\\,{lerp}\\,{expr})"
+        lerp = f"({v0}+({slope:.2f})*(t-{t0:.2f}))"
+        expr = f"if(lt(t\\,{t1:.2f})\\,{lerp}\\,{expr})"
     return expr
 
 
@@ -151,38 +162,34 @@ async def smart_crop_to_vertical(
     target_w: int = 1080,
     target_h: int = 1920,
     crf: int = 20,
-    sample_fps: float = 2.0,
+    sample_fps: float = _SAMPLE_FPS,
 ) -> Path:
-    """
-    Speaker-aware crop to 9:16. Falls back to center-crop if no faces found.
-    """
-    # Probe source dimensions.
+    """Speaker-aware crop to 9:16. Falls back to center-crop when no face is found."""
     info = await ff.probe(src)
     src_w, src_h = info.width, info.height
     if src_w == 0 or src_h == 0:
         raise ValueError("smart_crop: source has zero dimension")
 
-    # Determine the crop window inside the source: tallest 9:16 that fits.
+    # The tallest 9:16 window that fits the source.
     target_aspect = target_w / target_h
-    if src_w / src_h > target_aspect:
-        # Source wider than target → crop horizontally, full height.
+    if src_w / src_h > target_aspect:        # wider than 9:16 → pan horizontally, full height
         crop_h = src_h
         crop_w = int(round(src_h * target_aspect))
-    else:
-        # Source taller than target → crop vertically, full width.
+    else:                                    # taller → pan vertically, full width
         crop_w = src_w
         crop_h = int(round(src_w / target_aspect))
+    crop_w = min(crop_w, src_w)
+    crop_h = min(crop_h, src_h)
 
     track = _sample_faces(src, sample_fps=sample_fps)
-
     if track is None:
-        logger.info("smart_crop: no face track, using center crop for {}", src.name)
-        x_expr = f"{max(0, (src_w - crop_w) // 2)}"
-        y_expr = f"{max(0, (src_h - crop_h) // 2)}"
+        logger.info("smart_crop: no face track → center crop for {}", src.name)
+        x_expr = str(max(0, (src_w - crop_w) // 2))
+        y_expr = str(max(0, (src_h - crop_h) // 2))
     else:
-        logger.info("smart_crop: tracking {} keyframes over {}", len(track.t), src.name)
-        x_expr = _build_crop_expr(track, src_dim=src_w, crop_dim=crop_w, axis="x")
-        y_expr = _build_crop_expr(track, src_dim=src_h, crop_dim=crop_h, axis="y")
+        logger.info("smart_crop: tracking face over {} ({} samples)", src.name, len(track.t))
+        x_expr = _crop_origin_expr(track.t, track.cx, src_dim=src_w, crop_dim=crop_w)
+        y_expr = _crop_origin_expr(track.t, track.cy, src_dim=src_h, crop_dim=crop_h)
 
     filt = (
         f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr},"
