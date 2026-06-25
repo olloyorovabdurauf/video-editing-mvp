@@ -337,6 +337,11 @@ async def _render_all(ctx, req, segments, raw_transcript, out_dir, broll_dir,
     total = len(segments)
     results: list[ReelArtifact | None] = [None] * total
     sem = asyncio.Semaphore(_render_concurrency())
+    # MediaPipe/TF-Lite (smart crop face detection) is NOT safe to run several
+    # times concurrently in one process — it corrupts the ffmpeg filter graph
+    # ("Error reinitializing filters"). Serialize just that step; everything else
+    # (cut, captions, music, encode, upload) still runs in parallel.
+    crop_lock = asyncio.Lock()
 
     async def worker(i: int, seg: Segment) -> None:
         async with sem:
@@ -344,7 +349,7 @@ async def _render_all(ctx, req, segments, raw_transcript, out_dir, broll_dir,
                 art = await _render_segment(
                     i, seg, ctx=ctx, req=req, source=source, raw_transcript=raw_transcript,
                     out_dir=out_dir, broll_dir=broll_dir, target_dims=target_dims,
-                    is_vertical=is_vertical)
+                    is_vertical=is_vertical, crop_lock=crop_lock)
             except Exception as e:                       # one clip failing must not sink the rest
                 logger.warning("clip {} render failed, skipping: {}", i, e)
                 return
@@ -356,7 +361,7 @@ async def _render_all(ctx, req, segments, raw_transcript, out_dir, broll_dir,
 
 
 async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
-                          broll_dir, target_dims, is_vertical) -> ReelArtifact:
+                          broll_dir, target_dims, is_vertical, crop_lock) -> ReelArtifact:
     """One clip's pipeline: cut → reframe → b-roll → captions → music → upload →
     metadata. Mirrors the old loop body but fully awaitable so clips run in
     parallel under the semaphore."""
@@ -375,7 +380,12 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
     if is_vertical:
         framed = out_dir / f"seg_{i}_framed.mp4"
         if req.smart_crop:
-            await smart_crop_to_vertical(current, framed, target_w=1080, target_h=1920)
+            try:
+                async with crop_lock:        # serialize face detection (not concurrency-safe)
+                    await smart_crop_to_vertical(current, framed, target_w=1080, target_h=1920)
+            except Exception as e:           # never lose a clip to a crop hiccup — center-crop it
+                logger.warning("smart_crop failed for seg {}, center-cropping: {}", i, e)
+                await ff.reframe_to_vertical(current, framed)
         else:
             await ff.reframe_to_vertical(current, framed)
         current = framed
