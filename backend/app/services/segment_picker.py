@@ -35,7 +35,9 @@ You are a professional short-form video editor turning a long video into
 COMPLETE standalone clips for Reels, Shorts and TikTok. You are NOT a highlight
 extractor: never return a lone hook, a clever sentence, or a contextless moment.
 
-Return up to {n} of the best SELF-CONTAINED clips. Each clip MUST:
+Find {n} DISTINCT complete clips spread across DIFFERENT parts of the video
+(beginning, middle, end) — not {n} variations of the same moment. Aim for exactly
+{n}. Each clip MUST:
 - Be between {min_dur} and {max_dur} seconds long. NEVER shorter than {min_dur}s.
 - Contain a COMPLETE idea the viewer fully understands WITHOUT the original video:
     0-5s            a strong hook / clear opening
@@ -84,14 +86,17 @@ reconstruct the verbatim text ourselves from the timestamps).
 }}
 """
 
-# Used only when the strict pass finds nothing complete. We still demand a full
-# minimum-length clip — just relax the completeness bar and return the best one.
-LENIENT_SYSTEM_PROMPT = """\
-You are a short-form video editor. The strict pass found no fully complete clip.
-Return the SINGLE most self-contained {min_dur}-{max_dur}s clip you can — it must
-still be at least {min_dur}s, begin and end on sentence boundaries, and cover a
-whole thought (not a fragment). Score it honestly (completeness 0.4-0.7). Return
-STRICT JSON, same shape as requested.
+# Fill pass: we already have some clips but fewer than the user asked for. Find
+# MORE distinct complete clips from OTHER parts of the video, relaxing the
+# completeness bar slightly (still full {min_dur}-{max_dur}s, sentence-bounded).
+FILL_SYSTEM_PROMPT = """\
+You are a short-form video editor. Find up to {n} MORE distinct, self-contained
+{min_dur}-{max_dur}s clips from parts of the video not already obviously covered.
+Each must still be at least {min_dur}s, begin and end on sentence boundaries, and
+cover a WHOLE thought (hook → context → value → payoff) — never a fragment. These
+can be solid rather than perfect: score completeness honestly (0.45-0.8). The
+0-5s/5-15s/15-{value_end}s/{value_end}-end structure still applies. STRICT JSON,
+same shape as requested.
 """
 
 
@@ -156,30 +161,63 @@ async def pick_segments(
         return picks
 
     strict = SYSTEM_PROMPT.format(n=n, min_dur=min_eff, max_dur=max_duration_s, value_end=value_end)
-    lenient = LENIENT_SYSTEM_PROMPT.format(min_dur=min_eff, max_dur=max_duration_s)
+    fill = FILL_SYSTEM_PROMPT.format(n=n, min_dur=min_eff, max_dur=max_duration_s, value_end=value_end)
 
     out: list[Segment] = []
     try:
-        logger.info("clip analysis (cheap={}) {}-{}s on {} chars",
-                    settings.openai_analysis_model, min_eff, max_duration_s, len(compressed))
+        logger.info("clip analysis (cheap={}) target n={} {}-{}s on {} chars",
+                    settings.openai_analysis_model, n, min_eff, max_duration_s, len(compressed))
         out = await _ask(settings.openai_analysis_model, strict, 0.4, min_completeness=0.6)
-        if not out:
-            logger.info("cheap pass found no complete clip → escalating to {}",
-                        settings.openai_escalation_model)
-            out = await _ask(settings.openai_escalation_model, strict, 0.4, min_completeness=0.6)
-        if not out:
-            out = await _ask(settings.openai_escalation_model, lenient, 0.5, min_completeness=0.4)
+        # Escalate whenever we're SHORT of the requested count — not only at zero.
+        # This is the "user asked for 5, got 1" fix: keep gathering distinct clips
+        # until we reach n (or the video genuinely runs out of complete material).
+        if len(_dedupe_overlap(out)) < n:
+            logger.info("cheap pass gave {}/{} → escalating to {}",
+                        len(out), n, settings.openai_escalation_model)
+            out = _merge(out, await _ask(settings.openai_escalation_model, strict, 0.5, min_completeness=0.6))
+        if len(_dedupe_overlap(out)) < n:
+            logger.info("still short ({}/{}) → relaxed fill pass", len(_dedupe_overlap(out)), n)
+            out = _merge(out, await _ask(settings.openai_escalation_model, fill, 0.6, min_completeness=0.45))
     except Exception as e:
         logger.warning("segment analysis failed: {}", e)
+
+    out = _dedupe_overlap(out)                 # drop near-duplicate / overlapping windows
+    out.sort(key=lambda x: x.score, reverse=True)
+    out = out[:n]
+    out.sort(key=lambda x: x.start)            # chronological order for the user
 
     if not out:
         synth = _synthesize_from_transcript(transcript, min_eff, max_duration_s)
         out = [synth] if synth else []
 
-    out = out[:n]
     if out:
         ai_cache.set_json(ck, [s.model_dump() for s in out], ttl_s=settings.segment_cache_ttl_s)
     return out
+
+
+def _merge(a: list[Segment], b: list[Segment]) -> list[Segment]:
+    return list(a) + list(b)
+
+
+def _dedupe_overlap(segs: list[Segment], max_overlap: float = 0.4) -> list[Segment]:
+    """
+    Keep distinct clips: greedily accept the highest-scoring, rejecting any clip
+    that overlaps an already-kept one by more than `max_overlap` of the shorter
+    clip. Prevents three "clips" that are really the same moment.
+    """
+    kept: list[Segment] = []
+    for s in sorted(segs, key=lambda x: x.score, reverse=True):
+        clash = False
+        for k in kept:
+            inter = min(s.end, k.end) - max(s.start, k.start)
+            if inter > 0:
+                shorter = min(s.end - s.start, k.end - k.start) or 1.0
+                if inter / shorter > max_overlap:
+                    clash = True
+                    break
+        if not clash:
+            kept.append(s)
+    return kept
 
 
 def _safe_segments(resp: Any) -> list[dict]:

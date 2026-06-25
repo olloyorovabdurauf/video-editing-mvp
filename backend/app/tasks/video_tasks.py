@@ -208,158 +208,27 @@ def t_render(self, ctx: dict) -> dict:
     we never re-encode for free. The encoder settings (preset/CRF) stay
     consistent across passes so quality doesn't degrade.
     """
-    _update(ctx["job_id"], status=ReelJobStatus.RENDERING.value, progress=0.60)
     req = ReelCreateRequest(**ctx["payload"])
-    source = Path(ctx["source_path"])
     out_dir = settings.storage_local_dir / "output" / ctx["job_id"]
     out_dir.mkdir(parents=True, exist_ok=True)
     broll_dir = settings.storage_local_dir / "intermediate" / ctx["job_id"]
     broll_dir.mkdir(parents=True, exist_ok=True)
 
-    # Lazy imports — keep the task module light at import time.
-    from app.services import music as music_svc
-    from app.services.captions import write_ass
-    from app.services.smart_crop import smart_crop_to_vertical
-
-    artifacts: list[ReelArtifact] = []
     segments = [Segment(**s) for s in ctx["segments"]]
     raw_transcript = json.loads(Path(ctx["transcript_path"]).read_text(encoding="utf-8"))
     is_vertical = req.aspect == AspectRatio.VERTICAL
     target_dims = (1080, 1920) if is_vertical else (1920, 1080)
 
-    for i, seg in enumerate(segments):
-        progress = 0.60 + (0.35 * (i / max(1, len(segments))))
-        _update(ctx["job_id"], progress=progress, message=f"rendering clip {i + 1}/{len(segments)}")
+    _update(ctx["job_id"], status=ReelJobStatus.RENDERING.value, progress=0.60,
+            total_clips=len(segments), completed_clips=0,
+            message=f"rendering {len(segments)} clips")
 
-        # 1. Cut (re-encode for frame-accurate boundaries).
-        cut_path = out_dir / f"seg_{i}_cut.mp4"
-        _run(ff.cut(source, cut_path, start=seg.start, end=seg.end, reencode=True))
-        current = cut_path
-
-        # 2. Reframe — smart crop for vertical, identity for horizontal.
-        if is_vertical:
-            framed = out_dir / f"seg_{i}_framed.mp4"
-            if req.smart_crop:
-                _run(smart_crop_to_vertical(current, framed,
-                                            target_w=1080, target_h=1920))
-            else:
-                _run(ff.reframe_to_vertical(current, framed))
-            current = framed
-
-        # 3. B-roll: AI first (premium), stock as fallback.
-        ai_clips_for_seg = (ctx.get("ai_broll_by_segment") or {}).get(str(i)) \
-            or (ctx.get("ai_broll_by_segment") or {}).get(i, [])
-        broll_meta = []
-
-        if req.use_ai_broll and ai_clips_for_seg:
-            from app.services.creative_engine.compositor import CompositeClip, composite
-            composite_clips = [
-                CompositeClip(
-                    path=Path(c["path"]),
-                    start=max(0.0, float(c["window_start_abs"]) - seg.start),
-                    duration=max(0.5, float(c["window_end_abs"]) - float(c["window_start_abs"])),
-                    dissolve=0.5,
-                )
-                for c in ai_clips_for_seg
-            ]
-            try:
-                current = _run(composite(current, composite_clips, out_dir,
-                                         name_prefix=f"seg_{i}_aibroll"))
-            except Exception as e:
-                logger.warning("AI b-roll composite failed for seg {}: {}", i, e)
-                ai_clips_for_seg = []  # fall through to stock
-
-        if req.add_broll and not ai_clips_for_seg:
-            try:
-                broll_meta = _run(broll_svc.find_broll_for_segment(
-                    seg, i,
-                    orientation="portrait" if is_vertical else "landscape",
-                    download_to=broll_dir,
-                ))
-            except Exception as e:
-                logger.warning("stock b-roll lookup failed for seg {}: {}", i, e)
-                broll_meta = []
-            for j, clip in enumerate(broll_meta):
-                local = broll_dir / f"broll_seg{i}_{j}.mp4"
-                if not local.exists():
-                    continue
-                overlaid = out_dir / f"seg_{i}_broll{j}.mp4"
-                _run(ff.overlay_with_dissolve(
-                    current, local, overlaid,
-                    start=clip.start_offset,
-                    duration=clip.duration,
-                    dissolve=0.4,
-                ))
-                current = overlaid
-
-        # 4. Animated captions (the single biggest "this looks pro" lever).
-        if req.caption_style != "none":
-            words_in_segment = [
-                transcription.Word(
-                    text=w["text"],
-                    start=max(0.0, w["start"] - seg.start),
-                    end=max(0.0, w["end"] - seg.start),
-                )
-                for w in raw_transcript["words"]
-                if w["start"] >= seg.start and w["end"] <= seg.end
-            ]
-            if words_in_segment:
-                ass_path = out_dir / f"seg_{i}.ass"
-                write_ass(
-                    words_in_segment, ass_path,
-                    style=req.caption_style,
-                    resolution=target_dims,
-                )
-                captioned = out_dir / f"seg_{i}_cap.mp4"
-                _run(ff.burn_ass(current, ass_path, captioned))
-                current = captioned
-
-        # 5. Music bed (mood-selected, auto-ducked under speech).
-        if req.add_music:
-            try:
-                track = _run(music_svc.pick_track(seg, override_mood=req.mood))
-            except Exception as e:
-                logger.warning("music pick failed for seg {}: {}", i, e)
-                track = None
-            if track:
-                with_music = out_dir / f"seg_{i}_mix.mp4"
-                try:
-                    _run(ff.mix_music(current, track.path, with_music,
-                                      music_volume=0.18, duck=True))
-                    current = with_music
-                except Exception as e:
-                    logger.warning("music mix failed for seg {}: {}", i, e)
-
-        # 6. Promote to final name + upload to durable storage.
-        # In dev, LocalStorage returns "/storage/...". In prod (S3/R2),
-        # it returns the public CDN URL. Either way, the frontend can fetch it.
-        final = out_dir / f"reel_{i}.mp4"
-        if current != final:
-            current.rename(final)
-
-        from app.services.storage import get_storage
-        output_url = get_storage().put(
-            final, key=f"output/{ctx['job_id']}/{final.name}",
-        )
-
-        artifacts.append(ReelArtifact(
-            segment=seg,
-            output_url=output_url,
-            broll=broll_meta,
-        ))
-
-    # Generate ready-to-post title/caption/hashtags per clip. Best-effort: the
-    # clips are already rendered, so a metadata hiccup must never fail the job.
-    try:
-        from app.services import clip_metadata
-        metas = _run(clip_metadata.generate_for_clips(
-            [clip_metadata.ClipInput(transcript=a.segment.transcript, reason=a.segment.reason)
-             for a in artifacts]
-        ))
-        for a, m in zip(artifacts, metas):
-            a.title, a.caption, a.hashtags = m.title, m.caption, m.hashtags
-    except Exception as e:
-        logger.warning("clip metadata step skipped: {}", e)
+    # Render ALL clips CONCURRENTLY (was a sequential loop — the multi-clip
+    # bottleneck). Each clip streams into job state the instant it finishes, so
+    # the UI shows the first reel in tens of seconds instead of at the very end.
+    artifacts = _run(_render_all(
+        ctx, req, segments, raw_transcript, out_dir, broll_dir, target_dims, is_vertical,
+    ))
 
     # Settle credits — refund the over-estimate, charge any overage.
     job_state = json.loads(r.get(_key(ctx["job_id"])) or "{}")
@@ -419,6 +288,166 @@ def t_render(self, ctx: dict) -> dict:
 
     logger.info("job {} done: {} reels, ${} cost, {}s", ctx["job_id"], len(artifacts), cost, proc_s)
     return {"job_id": ctx["job_id"], "ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Concurrent, streaming render — render all clips in parallel and push each one
+# into job state the moment it finishes (so the UI shows results incrementally).
+# ---------------------------------------------------------------------------
+
+def _render_concurrency() -> int:
+    return max(1, settings.render_concurrency)
+
+
+def _commit_clip(job_id: str, artifact: ReelArtifact, total: int) -> None:
+    """Append a finished clip to job state immediately. Runs without awaiting, so
+    the Redis read-modify-write is atomic within the event loop (no lock needed)."""
+    st = json.loads(r.get(_key(job_id)) or "{}")
+    arts = st.get("artifacts", [])
+    arts.append(artifact.model_dump(mode="json"))
+    st["artifacts"] = arts
+    st["completed_clips"] = len(arts)
+    st["progress"] = round(min(0.95, 0.60 + 0.35 * (len(arts) / max(1, total))), 3)
+    st.setdefault("status", ReelJobStatus.RENDERING.value)
+    st["message"] = f"{len(arts)}/{total} clips ready"
+    r.setex(_key(job_id), 60 * 60 * 24, json.dumps(st))
+
+
+async def _render_all(ctx, req, segments, raw_transcript, out_dir, broll_dir,
+                      target_dims, is_vertical) -> list[ReelArtifact]:
+    source = Path(ctx["source_path"])
+    total = len(segments)
+    results: list[ReelArtifact | None] = [None] * total
+    sem = asyncio.Semaphore(_render_concurrency())
+
+    async def worker(i: int, seg: Segment) -> None:
+        async with sem:
+            try:
+                art = await _render_segment(
+                    i, seg, ctx=ctx, req=req, source=source, raw_transcript=raw_transcript,
+                    out_dir=out_dir, broll_dir=broll_dir, target_dims=target_dims,
+                    is_vertical=is_vertical)
+            except Exception as e:                       # one clip failing must not sink the rest
+                logger.warning("clip {} render failed, skipping: {}", i, e)
+                return
+            results[i] = art
+            _commit_clip(ctx["job_id"], art, total)      # stream it to the UI now
+
+    await asyncio.gather(*[worker(i, s) for i, s in enumerate(segments)])
+    return [a for a in results if a is not None]
+
+
+async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
+                          broll_dir, target_dims, is_vertical) -> ReelArtifact:
+    """One clip's pipeline: cut → reframe → b-roll → captions → music → upload →
+    metadata. Mirrors the old loop body but fully awaitable so clips run in
+    parallel under the semaphore."""
+    from app.services import clip_metadata
+    from app.services import music as music_svc
+    from app.services.captions import write_ass
+    from app.services.smart_crop import smart_crop_to_vertical
+    from app.services.storage import get_storage
+
+    # 1. Cut (re-encode for frame-accurate boundaries).
+    cut_path = out_dir / f"seg_{i}_cut.mp4"
+    await ff.cut(source, cut_path, start=seg.start, end=seg.end, reencode=True)
+    current = cut_path
+
+    # 2. Reframe — smart crop for vertical, identity for horizontal.
+    if is_vertical:
+        framed = out_dir / f"seg_{i}_framed.mp4"
+        if req.smart_crop:
+            await smart_crop_to_vertical(current, framed, target_w=1080, target_h=1920)
+        else:
+            await ff.reframe_to_vertical(current, framed)
+        current = framed
+
+    # 3. B-roll: AI first (premium), stock as fallback.
+    ai_clips_for_seg = (ctx.get("ai_broll_by_segment") or {}).get(str(i)) \
+        or (ctx.get("ai_broll_by_segment") or {}).get(i, [])
+    broll_meta = []
+    if req.use_ai_broll and ai_clips_for_seg:
+        from app.services.creative_engine.compositor import CompositeClip, composite
+        composite_clips = [
+            CompositeClip(
+                path=Path(c["path"]),
+                start=max(0.0, float(c["window_start_abs"]) - seg.start),
+                duration=max(0.5, float(c["window_end_abs"]) - float(c["window_start_abs"])),
+                dissolve=0.5,
+            )
+            for c in ai_clips_for_seg
+        ]
+        try:
+            current = await composite(current, composite_clips, out_dir, name_prefix=f"seg_{i}_aibroll")
+        except Exception as e:
+            logger.warning("AI b-roll composite failed for seg {}: {}", i, e)
+            ai_clips_for_seg = []
+    if req.add_broll and not ai_clips_for_seg:
+        try:
+            broll_meta = await broll_svc.find_broll_for_segment(
+                seg, i, orientation="portrait" if is_vertical else "landscape",
+                download_to=broll_dir)
+        except Exception as e:
+            logger.warning("stock b-roll lookup failed for seg {}: {}", i, e)
+            broll_meta = []
+        for j, clip in enumerate(broll_meta):
+            local = broll_dir / f"broll_seg{i}_{j}.mp4"
+            if not local.exists():
+                continue
+            overlaid = out_dir / f"seg_{i}_broll{j}.mp4"
+            await ff.overlay_with_dissolve(current, local, overlaid,
+                                           start=clip.start_offset, duration=clip.duration, dissolve=0.4)
+            current = overlaid
+
+    # 4. Animated captions.
+    if req.caption_style != "none":
+        words_in_segment = [
+            transcription.Word(text=w["text"],
+                               start=max(0.0, w["start"] - seg.start),
+                               end=max(0.0, w["end"] - seg.start))
+            for w in raw_transcript["words"]
+            if w["start"] >= seg.start and w["end"] <= seg.end
+        ]
+        if words_in_segment:
+            ass_path = out_dir / f"seg_{i}.ass"
+            write_ass(words_in_segment, ass_path, style=req.caption_style, resolution=target_dims)
+            captioned = out_dir / f"seg_{i}_cap.mp4"
+            await ff.burn_ass(current, ass_path, captioned)
+            current = captioned
+
+    # 5. Music bed (mood-selected, auto-ducked under speech).
+    if req.add_music:
+        try:
+            track = await music_svc.pick_track(seg, override_mood=req.mood)
+        except Exception as e:
+            logger.warning("music pick failed for seg {}: {}", i, e)
+            track = None
+        if track:
+            with_music = out_dir / f"seg_{i}_mix.mp4"
+            try:
+                await ff.mix_music(current, track.path, with_music, music_volume=0.18, duck=True)
+                current = with_music
+            except Exception as e:
+                logger.warning("music mix failed for seg {}: {}", i, e)
+
+    # 6. Promote to final name + upload to durable storage.
+    final = out_dir / f"reel_{i}.mp4"
+    if current != final:
+        current.rename(final)
+    output_url = get_storage().put(final, key=f"output/{ctx['job_id']}/{final.name}")
+
+    art = ReelArtifact(segment=seg, output_url=output_url, broll=broll_meta)
+
+    # Per-clip metadata so each clip streams to the UI fully formed (title +
+    # caption + hashtags). Best-effort — a metadata hiccup never drops the clip.
+    try:
+        metas = await clip_metadata.generate_for_clips(
+            [clip_metadata.ClipInput(transcript=seg.transcript, reason=seg.reason)])
+        if metas:
+            art.title, art.caption, art.hashtags = metas[0].title, metas[0].caption, metas[0].hashtags
+    except Exception as e:
+        logger.warning("clip {} metadata skipped: {}", i, e)
+    return art
 
 
 # ---------------------------------------------------------------------------

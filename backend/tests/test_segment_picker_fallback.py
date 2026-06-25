@@ -188,6 +188,49 @@ async def test_cache_hit_short_circuits(patched_redis):
     assert create.call_count == after                  # no new LLM call on 2nd run
 
 
+def test_dedupe_overlap_keeps_distinct_drops_overlap():
+    def S(start, end, score):
+        from app.schemas.reel import Segment
+        return Segment(start=start, end=end, score=score, completeness_score=0.8, transcript="t")
+    # Two heavily-overlapping clips (keep the higher score) + one distinct.
+    out = sp._dedupe_overlap([S(0, 55, 0.7), S(5, 58, 0.9), S(80, 135, 0.6)])
+    assert len(out) == 2
+    kept_starts = {s.start for s in out}
+    assert 5 in kept_starts and 80 in kept_starts and 0 not in kept_starts
+
+
+@pytest.mark.asyncio
+async def test_accumulates_distinct_clips_toward_n():
+    """The 'asked for 5, got 1' fix: keep gathering across passes until we reach n."""
+    t = _talk(sentences=16)                       # ~160s → room for several clips
+    cheap = _resp({"segments": [_seg(0, 50)]})    # 1 clip
+    esc = _resp({"segments": [_seg(60, 110)]})    # +1 from the middle
+    fill = _resp({"segments": [_seg(115, 160)]})  # +1 from the end
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        create = AsyncMock(side_effect=[cheap, esc, fill])
+        oai.return_value.chat.completions.create = create
+        out = await sp.pick_segments(t, n=5, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert create.call_count == 3                 # escalated + filled because still < n
+    assert len(out) == 3                          # 3 distinct clips gathered
+    starts = [s.start for s in out]
+    assert starts == sorted(starts)               # returned chronologically
+    for a, b in zip(out, out[1:]):                # non-overlapping
+        assert a.end <= b.start + 1
+    assert all(MIN - 2 <= s.duration <= MAX for s in out)
+
+
+@pytest.mark.asyncio
+async def test_stops_escalating_once_n_met():
+    t = _talk(sentences=16)
+    cheap = _resp({"segments": [_seg(0, 50), _seg(60, 110), _seg(115, 160)]})  # 3 at once
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        create = AsyncMock(side_effect=[cheap])
+        oai.return_value.chat.completions.create = create
+        out = await sp.pick_segments(t, n=3, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert create.call_count == 1                 # got 3 of 3 on the cheap pass → no escalation
+    assert len(out) == 3
+
+
 @pytest.mark.asyncio
 async def test_truncated_json_does_not_crash():
     t = _talk()

@@ -59,6 +59,8 @@ export interface JobResponse {
   status: ReelStatus;
   progress: number;
   message?: string | null;
+  total_clips?: number | null;
+  completed_clips?: number | null;
   artifacts: ReelArtifact[];
 }
 

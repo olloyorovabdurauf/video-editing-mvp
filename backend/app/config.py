@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     # call for short social reels where render latency matters more than bytes.
     # Drop to "ultrafast" for max speed, or "veryfast"/"faster" for smaller files.
     ffmpeg_preset: str = "superfast"
+    # How many clips to render concurrently within one job. The render is the
+    # multi-clip bottleneck; on dedicated CPUs 3 parallel ffmpeg pipelines beat a
+    # sequential loop without thrashing. Bound by core count in practice.
+    render_concurrency: int = 3
 
     @property
     def is_prod(self) -> bool:

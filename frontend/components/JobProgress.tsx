@@ -39,7 +39,14 @@ export function JobProgress({ job }: { job: JobResponse }) {
             {failed ? "Something went wrong" : succeeded ? "Your clips are ready" : "Creating your clips…"}
           </span>
         </div>
-        <span className="text-sm font-semibold tabular-nums text-white/70">{pct}%</span>
+        <div className="flex items-center gap-3">
+          {!!job.total_clips && (job.completed_clips ?? 0) > 0 && !succeeded && (
+            <span className="text-xs font-medium text-accent">
+              {job.completed_clips}/{job.total_clips} clips
+            </span>
+          )}
+          <span className="text-sm font-semibold tabular-nums text-white/70">{pct}%</span>
+        </div>
       </div>
 
       {/* Progress bar */}

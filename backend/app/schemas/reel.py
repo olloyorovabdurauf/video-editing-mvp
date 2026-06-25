@@ -149,6 +149,10 @@ class ReelJobResponse(BaseModel):
     status: ReelJobStatus
     progress: float = Field(0.0, ge=0, le=1)
     message: str | None = None
+    # Streaming render: clips appear in `artifacts` as each finishes. These let
+    # the UI show "X of Y clips ready" while the rest are still rendering.
+    total_clips: int | None = None
+    completed_clips: int | None = None
     artifacts: list[ReelArtifact] = []
     # Observability (populated on completion)
     cost_usd: float | None = None
