@@ -21,6 +21,7 @@ export interface ReelCreateRequest {
   aspect: AspectRatio;
   target_count: number;
   max_duration_s: number;
+  min_duration_s: number;
   caption_style: CaptionStyle;
   smart_crop: boolean;
   add_broll: boolean;            // stock (Pexels) — free
@@ -35,7 +36,12 @@ export interface Segment {
   start: number;
   end: number;
   hook_score: number;
+  value_score?: number;
+  completeness_score?: number;
+  payoff_score?: number;
+  score?: number;        // overall, completeness-weighted
   reason: string;
+  summary?: string;
   transcript: string;
 }
 

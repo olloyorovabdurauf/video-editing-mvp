@@ -189,6 +189,7 @@ def t_analyze(self, ctx: dict) -> dict:
     segments = _run(segment_picker.pick_segments(
         transcript,
         n=req.target_count,
+        min_duration_s=req.min_duration_s,
         max_duration_s=req.max_duration_s,
         prompt=req.prompt,
     ))

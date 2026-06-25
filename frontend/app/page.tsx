@@ -50,6 +50,7 @@ export default function HomePage() {
         source_url: url.trim(),
         aspect: "9:16",
         target_count: count,
+        min_duration_s: 45,
         max_duration_s: 60,
         caption_style: captions ? "karaoke" : "none",
         smart_crop: true,

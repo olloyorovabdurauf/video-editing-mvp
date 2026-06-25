@@ -1,13 +1,17 @@
 """
-Viral segment picker.
+Complete-clip picker.
 
-We feed GPT-4o a compressed transcript with timestamps and ask it to return
-ranked candidate clips as strict JSON. The prompt is engineered around three
-ideas that consistently produce hook-worthy picks:
+This is a long-form → short-form *repurposing* step, NOT a highlight extractor.
+We ask the model for SELF-CONTAINED clips (a full hook → context → value →
+payoff arc) sized for Reels/Shorts/TikTok, and then we mechanically enforce the
+rules the model can't be trusted to follow exactly:
 
-  1. Reward openings that violate expectation ("the thing nobody tells you about X").
-  2. Penalize segments that end mid-thought — chops kill watch-time on Reels.
-  3. Bias toward self-contained moments (a setup + payoff inside the window).
+  1. Duration is forced into [min_duration_s, max_duration_s] (default 45-60s) —
+     never a 5-10s fragment.
+  2. Start/end are snapped to SENTENCE boundaries, and the window is extended to
+     reach the minimum length, so a clip never opens or closes mid-thought.
+  3. Clips are ranked by an overall score that weights *story completeness* most,
+     not the hook alone. Clips below a completeness threshold are dropped.
 """
 from __future__ import annotations
 
@@ -20,24 +24,41 @@ from openai import AsyncOpenAI
 from app.config import get_settings
 from app.schemas.reel import Segment
 from app.services import ai_cache
-from app.services.transcription import Transcript
+from app.services.transcription import Transcript, Word
+
+# Overall score weights. Completeness + value dominate so we stop rewarding lone
+# hooks. Tunable, must sum to 1.0.
+_W_HOOK, _W_VALUE, _W_COMPLETE, _W_PAYOFF = 0.20, 0.25, 0.35, 0.20
 
 SYSTEM_PROMPT = """\
-You are a senior short-form video editor. Given a timestamped transcript, you
-return the {n} segments most likely to perform on Reels, Shorts, and TikTok.
+You are a professional short-form video editor turning a long video into
+COMPLETE standalone clips for Reels, Shorts and TikTok. You are NOT a highlight
+extractor: never return a lone hook, a clever sentence, or a contextless moment.
 
-Hard rules:
-- Each clip must be self-contained: a viewer dropping in cold understands it.
-- Start on a strong hook (claim, question, or pattern interrupt) — never mid-sentence.
-- End on a payoff or punchline — never mid-thought.
-- Clip duration must be between 12 and {max_dur} seconds.
-- Return STRICT JSON. No prose, no markdown.
+Return up to {n} of the best SELF-CONTAINED clips. Each clip MUST:
+- Be between {min_dur} and {max_dur} seconds long. NEVER shorter than {min_dur}s.
+- Contain a COMPLETE idea the viewer fully understands WITHOUT the original video:
+    0-5s            a strong hook / clear opening
+    5-15s           context or the problem
+    15-{value_end}s the main value, story, or explanation
+    {value_end}-end a conclusion / payoff that resolves the opening
+- Begin at the START of a thought (a sentence boundary), never mid-sentence.
+- End on a finished thought — never mid-sentence, never on "...and that's why".
 
-Score rubric (hook_score, 0..1):
-  0.9+  shocking claim, contrarian POV, or strong emotional beat
-  0.7   clear insight, surprising fact
-  0.5   competent but generic
-  <0.5  skip
+Do NOT select on emotional words, controversy, or energy alone. Ask: does this
+section have a clear beginning, explain a full idea, deliver value, and end
+satisfyingly? Could it stand alone as a Reel?
+
+For EACH clip score 0..1:
+  hook_score          strength of the opening
+  value_score         how much insight/value the body delivers
+  completeness_score  does it stand alone as a full idea with a clear beginning,
+                      middle and end? THIS MATTERS MOST.
+  payoff_score        how resolved/satisfying the ending is
+Only return clips with completeness_score >= 0.6. If the video has fewer than
+{n} genuinely complete clips, return FEWER — never pad with fragments.
+
+Return STRICT JSON. No prose, no markdown.
 """
 
 USER_TEMPLATE = """\
@@ -46,35 +67,31 @@ User directive (may be empty): {prompt}
 Transcript (each line = "[start-end] text"):
 {lines}
 
-Return JSON. Do NOT echo the transcript text — only timestamps + a short
-reason. (We reconstruct the verbatim text ourselves from the timestamps; this
-keeps the response small so it never truncates on long videos.)
+Pick complete {min_dur}-{max_dur}s clips. Return JSON. Do NOT echo the transcript
+text — only timestamps, scores, a one-line reason and a one-line summary (we
+reconstruct the verbatim text ourselves from the timestamps).
 {{
   "segments": [
     {{
-      "start": <float>,
-      "end":   <float>,
-      "hook_score": <float 0..1>,
-      "reason": "<one short sentence on why this hooks>"
+      "start": <float, a sentence boundary>,
+      "end": <float, a sentence boundary, {min_dur}-{max_dur}s after start>,
+      "hook_score": <0..1>, "value_score": <0..1>,
+      "completeness_score": <0..1>, "payoff_score": <0..1>,
+      "reason": "<why this works as a complete standalone clip>",
+      "summary": "<the complete idea this clip explains, one line>"
     }}
   ]
 }}
 """
 
-# Used only when the strict pass finds nothing. A clipping tool should never
-# hand the user an empty result — return the best available moment and let
-# them judge. Scores will be honest (low), the duration floor is relaxed so
-# short source videos still yield a clip.
+# Used only when the strict pass finds nothing complete. We still demand a full
+# minimum-length clip — just relax the completeness bar and return the best one.
 LENIENT_SYSTEM_PROMPT = """\
-You are a short-form video editor. The strict viral pass found nothing.
-Return the SINGLE most engaging moment from this transcript anyway — even if
-it is not classically viral. You MUST return exactly one segment.
-
-Rules:
-- Duration between 6 and {max_dur} seconds (or the whole clip if shorter).
-- Start and end on natural sentence boundaries where possible.
-- hook_score should be an honest 0..0.6 reflecting the (limited) appeal.
-- Return STRICT JSON, same shape as requested.
+You are a short-form video editor. The strict pass found no fully complete clip.
+Return the SINGLE most self-contained {min_dur}-{max_dur}s clip you can — it must
+still be at least {min_dur}s, begin and end on sentence boundaries, and cover a
+whole thought (not a fragment). Score it honestly (completeness 0.4-0.7). Return
+STRICT JSON, same shape as requested.
 """
 
 
@@ -98,6 +115,7 @@ async def pick_segments(
     transcript: Transcript,
     *,
     n: int,
+    min_duration_s: int,
     max_duration_s: int,
     prompt: str | None,
 ) -> list[Segment]:
@@ -107,50 +125,55 @@ async def pick_segments(
     compressed = _compress(transcript)
     if not compressed:
         return []
+    # Source shorter than the floor → the whole thing is the only "clip".
+    total = transcript.words[-1].end - transcript.words[0].start
+    min_eff = min(min_duration_s, int(total))
 
-    # Cache: same video + same params → reuse picks (free + instant on retry).
-    ck = ai_cache.key("segpick", compressed, n, max_duration_s, prompt or "")
+    ck = ai_cache.key("segpick_v2", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
         return [Segment(**d) for d in cached]
 
-    async def _ask(model: str, system: str, temperature: float, min_dur: float) -> list[Segment]:
+    value_end = max(min_eff, max_duration_s - 15)
+
+    async def _ask(model: str, system: str, temperature: float, min_completeness: float) -> list[Segment]:
         resp = await client.chat.completions.create(
             model=model,
             response_format={"type": "json_object"},
             temperature=temperature,
-            max_tokens=1500,
+            max_tokens=2200,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user",   "content": USER_TEMPLATE.format(
-                    prompt=prompt or "(none)", lines=compressed)},
+                {"role": "user", "content": USER_TEMPLATE.format(
+                    prompt=prompt or "(none)", lines=compressed,
+                    min_dur=min_eff, max_dur=max_duration_s)},
             ],
         )
-        picks = _clamp(_safe_segments(resp), transcript, max_duration_s, min_dur=min_dur)
-        picks.sort(key=lambda x: x.hook_score, reverse=True)
+        picks = _clamp(_safe_segments(resp), transcript, min_eff, max_duration_s)
+        picks = [p for p in picks if p.completeness_score >= min_completeness]
+        picks.sort(key=lambda x: x.score, reverse=True)
         return picks
 
-    strict = SYSTEM_PROMPT.format(n=n, max_dur=max_duration_s)
-    lenient = LENIENT_SYSTEM_PROMPT.format(max_dur=max_duration_s)
+    strict = SYSTEM_PROMPT.format(n=n, min_dur=min_eff, max_dur=max_duration_s, value_end=value_end)
+    lenient = LENIENT_SYSTEM_PROMPT.format(min_dur=min_eff, max_dur=max_duration_s)
 
-    # Cost tiering: cheap model first; escalate to the strong model ONLY when
-    # the cheap pass finds nothing. Most videos never touch the expensive model.
     out: list[Segment] = []
     try:
-        logger.info("analysis (cheap={}) on {} chars", settings.openai_analysis_model, len(compressed))
-        out = await _ask(settings.openai_analysis_model, strict, 0.4, min_dur=5.0)
+        logger.info("clip analysis (cheap={}) {}-{}s on {} chars",
+                    settings.openai_analysis_model, min_eff, max_duration_s, len(compressed))
+        out = await _ask(settings.openai_analysis_model, strict, 0.4, min_completeness=0.6)
         if not out:
-            logger.info("cheap pass empty → escalating to {}", settings.openai_escalation_model)
-            out = await _ask(settings.openai_escalation_model, strict, 0.4, min_dur=5.0)
-        if not out:  # still nothing viral → best-available with strong model
-            out = await _ask(settings.openai_escalation_model, lenient, 0.5, min_dur=4.0)
+            logger.info("cheap pass found no complete clip → escalating to {}",
+                        settings.openai_escalation_model)
+            out = await _ask(settings.openai_escalation_model, strict, 0.4, min_completeness=0.6)
+        if not out:
+            out = await _ask(settings.openai_escalation_model, lenient, 0.5, min_completeness=0.4)
     except Exception as e:
         logger.warning("segment analysis failed: {}", e)
 
-    # Last resort: deterministic synthesis (never return nothing for speech).
     if not out:
-        synth = _synthesize_from_transcript(transcript, max_duration_s)
+        synth = _synthesize_from_transcript(transcript, min_eff, max_duration_s)
         out = [synth] if synth else []
 
     out = out[:n]
@@ -160,66 +183,137 @@ async def pick_segments(
 
 
 def _safe_segments(resp: Any) -> list[dict]:
-    """
-    Parse the model's JSON content defensively. response_format=json_object
-    *usually* yields valid JSON, but a truncated/odd response shouldn't crash
-    the whole job — return [] and let the fallback chain handle it.
-    """
     content = (resp.choices[0].message.content or "").strip()
     try:
         return json.loads(content).get("segments", [])
     except (json.JSONDecodeError, AttributeError) as e:
-        logger.warning("segment JSON parse failed ({}); first 120 chars: {!r}",
-                       e, content[:120])
+        logger.warning("segment JSON parse failed ({}); first 120 chars: {!r}", e, content[:120])
         return []
 
 
+def _f(v: Any, default: float = 0.5) -> float:
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Sentence-boundary editing — so clips never open or close mid-thought.
+# ---------------------------------------------------------------------------
+
+def _is_sentence_end(text: str) -> bool:
+    # A word ends a sentence if its last char is terminal punctuation. Decimals
+    # like "3.5" end in a digit (not a period), so no special-casing is needed.
+    t = text.rstrip()
+    return bool(t) and t[-1] in ".!?…"
+
+
+def _boundaries(words: list[Word]) -> tuple[list[float], list[float]]:
+    """Times where sentences START and END, from word punctuation."""
+    starts: list[float] = []
+    ends: list[float] = []
+    new_sentence = True
+    for w in words:
+        if new_sentence:
+            starts.append(w.start)
+        if _is_sentence_end(w.text):
+            ends.append(w.end)
+            new_sentence = True
+        else:
+            new_sentence = False
+    return starts, ends
+
+
+def _finalize_window(words: list[Word], start: float, end: float,
+                     min_s: float, max_s: float) -> tuple[float, float] | None:
+    """
+    Snap [start, end] to sentence boundaries and force the duration into
+    [min_s, max_s] by extending to the nearest sentence ends. Returns None if a
+    minimum-length window can't be formed (source genuinely too short here).
+    """
+    if len(words) < 2:
+        return None
+    t0, t1 = words[0].start, words[-1].end
+    starts, ends = _boundaries(words)
+    if not starts or not ends:
+        return None
+
+    start = max(t0, min(start, t1))
+    # Snap start back to the sentence start at/just before the requested start.
+    cand = [s for s in starts if s <= start + 0.4]
+    start = max(cand) if cand else t0
+
+    target_end = max(end, start + min_s)
+    # Prefer a sentence-end that lands the duration inside [min_s, max_s].
+    in_range = [e for e in ends if min_s <= (e - start) <= max_s]
+    if in_range:
+        # closest sentence-end to the model's requested end
+        end = min(in_range, key=lambda e: abs(e - target_end))
+    else:
+        under = [e for e in ends if (e - start) <= max_s and e > start]
+        end = max(under) if under else min(start + max_s, t1)
+
+    end = min(end, t1, start + max_s)
+    dur = end - start
+    if dur < min(min_s, t1 - t0) - 2.0:
+        return None
+    return (round(start, 2), round(end, 2))
+
+
 def _text_in_window(transcript: Transcript, start: float, end: float) -> str:
-    """Verbatim transcript text inside [start, end] — sliced from our own
-    word timestamps, so it's accurate and never bloats the LLM response."""
-    return " ".join(w.text for w in transcript.words if start <= w.start <= end)[:500]
+    return " ".join(w.text for w in transcript.words if start <= w.start <= end)[:1500]
 
 
-def _clamp(raw: list, transcript: Transcript, max_duration_s: int, *, min_dur: float) -> list[Segment]:
-    """Validate raw LLM picks (start/end/hook_score/reason) into Segments,
-    filling transcript text ourselves from word timestamps."""
+def _clamp(raw: list, transcript: Transcript, min_s: int, max_s: int) -> list[Segment]:
+    """Validate raw picks into complete, boundary-aligned, duration-correct clips."""
+    words = transcript.words
     out: list[Segment] = []
     for s in raw or []:
         if not isinstance(s, dict):
             continue
         try:
             start = float(s["start"]); end = float(s["end"])
-            seg = Segment(
-                start=start, end=end,
-                hook_score=float(s.get("hook_score", 0.5)),
-                reason=str(s.get("reason", ""))[:300],
-                transcript=_text_in_window(transcript, start, end),
-            )
-        except (KeyError, ValueError, TypeError) as e:
-            logger.warning("dropping malformed segment {}: {}", s, e)
+        except (KeyError, ValueError, TypeError):
             continue
-        if seg.end - seg.start < min_dur or seg.end - seg.start > max_duration_s + 5:
+        win = _finalize_window(words, start, end, float(min_s), float(max_s))
+        if win is None:
             continue
-        out.append(seg)
+        ws, we = win
+        hook = _f(s.get("hook_score")); value = _f(s.get("value_score"))
+        comp = _f(s.get("completeness_score")); pay = _f(s.get("payoff_score"))
+        overall = round(_W_HOOK * hook + _W_VALUE * value
+                        + _W_COMPLETE * comp + _W_PAYOFF * pay, 3)
+        out.append(Segment(
+            start=ws, end=we,
+            hook_score=hook, value_score=value, completeness_score=comp,
+            payoff_score=pay, score=overall,
+            reason=str(s.get("reason", ""))[:300],
+            summary=str(s.get("summary", ""))[:300],
+            transcript=_text_in_window(transcript, ws, we),
+        ))
     return out
 
 
-def _synthesize_from_transcript(transcript: Transcript, max_duration_s: int) -> Segment | None:
+def _synthesize_from_transcript(transcript: Transcript, min_s: int, max_s: int) -> Segment | None:
     """
-    Last-resort clip: cover the speech from its start up to max_duration_s.
-    Honest low hook_score; the text is the verbatim words in the window.
+    Last resort: a complete-length window starting at the first sentence, snapped
+    to sentence boundaries. Honest mid scores — better than an empty result.
     """
-    if not transcript.words:
+    words = transcript.words
+    if not words:
         return None
-    start = transcript.words[0].start
-    end = min(start + max_duration_s, transcript.words[-1].end)
-    if end - start < 3:
-        end = transcript.words[-1].end
-    text = " ".join(w.text for w in transcript.words if start <= w.start <= end)
+    win = _finalize_window(words, words[0].start, words[0].start + max_s, float(min_s), float(max_s))
+    if win is None:
+        ws, we = words[0].start, words[-1].end           # whole (short) clip
+    else:
+        ws, we = win
+    text = _text_in_window(transcript, ws, we)
     return Segment(
-        start=round(start, 2),
-        end=round(end, 2),
-        hook_score=0.3,
-        reason="Best available moment (no strongly viral hook detected).",
-        transcript=text[:500],
+        start=round(ws, 2), end=round(we, 2),
+        hook_score=0.4, value_score=0.5, completeness_score=0.6, payoff_score=0.4,
+        score=round(_W_HOOK * 0.4 + _W_VALUE * 0.5 + _W_COMPLETE * 0.6 + _W_PAYOFF * 0.4, 3),
+        reason="Best available complete section (no strongly viral hook detected).",
+        summary=(text[:120] + "…") if len(text) > 120 else text,
+        transcript=text,
     )

@@ -1,9 +1,9 @@
 """
-Segment-picker fallback tests.
+Complete-clip picker tests.
 
-A clipping product must never return zero clips for a video that has speech.
-We verify the deterministic pieces (clamp, synthesis) and the fallback wiring
-with the LLM mocked.
+The product extracts COMPLETE 45-60s clips, not highlight fragments. We verify
+the mechanical guarantees (sentence-boundary snapping, duration enforcement,
+completeness scoring/filtering) and the fallback wiring with the LLM mocked.
 """
 from __future__ import annotations
 
@@ -21,164 +21,181 @@ def _transcript(words: list[tuple[str, float, float]]) -> Transcript:
                       words=[Word(text=t, start=s, end=e) for t, s, e in words])
 
 
+def _talk(sentences: int = 9, words_per: int = 10, gap: float = 1.0) -> Transcript:
+    """A talk with sentence punctuation every `words_per` words (≈ words_per sec)."""
+    words: list[tuple[str, float, float]] = []
+    t = 0.0
+    for si in range(sentences):
+        for wi in range(words_per):
+            txt = f"w{si}x{wi}" + ("." if wi == words_per - 1 else "")
+            words.append((txt, round(t, 2), round(t + 0.4, 2)))
+            t += gap
+    return _transcript(words)
+
+
+MIN, MAX = 45, 60
+
+
 # ---------------------------------------------------------------------------
-# _clamp
+# Sentence boundaries + window finalization (the editing core)
 # ---------------------------------------------------------------------------
 
-def test_clamp_drops_too_short_and_too_long():
-    # LLM now returns only start/end/hook_score/reason (no transcript).
-    raw = [
-        {"start": 0, "end": 2, "hook_score": 0.9, "reason": "r"},   # 2s < min
-        {"start": 0, "end": 30, "hook_score": 0.8, "reason": "r"},  # ok (max 25+5)
-        {"start": 0, "end": 60, "hook_score": 0.8, "reason": "r"},  # 60s > 25+5
-    ]
-    t = _transcript([("hello", 1.0, 1.5), ("world", 10.0, 10.4)])
-    out = sp._clamp(raw, t, max_duration_s=25, min_dur=5.0)
+def test_is_sentence_end():
+    assert sp._is_sentence_end("done.")
+    assert sp._is_sentence_end("really?!".rstrip("!")) or sp._is_sentence_end("really?")
+    assert sp._is_sentence_end("wait…")
+    assert not sp._is_sentence_end("3.5")        # decimal, not a sentence end
+    assert not sp._is_sentence_end("middle")
+
+
+def test_finalize_window_snaps_and_enforces_duration():
+    t = _talk()                                  # ~90s, sentence ends at 9.4, 19.4, ...
+    win = sp._finalize_window(t.words, start=12.0, end=20.0, min_s=MIN, max_s=MAX)
+    assert win is not None
+    start, end = win
+    dur = end - start
+    assert MIN - 2 <= dur <= MAX                 # forced into range despite asking for 8s
+    # both ends land on sentence boundaries (start of a sentence / end of a sentence)
+    starts, ends = sp._boundaries(t.words)
+    assert any(abs(start - s) < 0.01 for s in starts)
+    assert any(abs(end - e) < 0.01 for e in ends)
+
+
+def test_finalize_window_caps_at_max():
+    t = _talk()
+    _, end = sp._finalize_window(t.words, 0.0, 200.0, MIN, MAX)  # asks for way too long
+    assert end <= 0.0 + MAX + 0.01
+
+
+def test_finalize_window_none_without_boundaries():
+    # No sentence punctuation → can't form a clean window → dropped.
+    t = _transcript([("a", 0, 0.4), ("b", 1, 1.4), ("c", 2, 2.4)])
+    assert sp._finalize_window(t.words, 0, 50, MIN, MAX) is None
+
+
+# ---------------------------------------------------------------------------
+# _clamp — scoring + duration + drop unformable
+# ---------------------------------------------------------------------------
+
+def test_clamp_builds_complete_scored_clip():
+    t = _talk()
+    raw = [{"start": 0, "end": 50, "hook_score": 0.9, "value_score": 0.7,
+            "completeness_score": 0.8, "payoff_score": 0.6, "reason": "r", "summary": "s"}]
+    out = sp._clamp(raw, t, MIN, MAX)
     assert len(out) == 1
-    assert out[0].end == 30
-    # transcript text is filled from our own words, not the LLM
-    assert "hello" in out[0].transcript
+    seg = out[0]
+    assert MIN - 2 <= seg.duration <= MAX
+    assert seg.completeness_score == 0.8 and seg.summary == "s"
+    expected = round(0.20 * 0.9 + 0.25 * 0.7 + 0.35 * 0.8 + 0.20 * 0.6, 3)
+    assert seg.score == expected
+    assert "w0x0" in seg.transcript                # text filled from our words
 
 
-def test_clamp_relaxed_min_keeps_short_clip():
-    raw = [{"start": 0, "end": 4.5, "hook_score": 0.4, "reason": "r"}]
-    t = _transcript([("a", 1.0, 1.2)])
-    assert len(sp._clamp(raw, t, 25, min_dur=4.0)) == 1   # kept at min_dur=4
-    assert len(sp._clamp(raw, t, 25, min_dur=5.0)) == 0   # dropped at min_dur=5
-
-
-def test_clamp_survives_missing_fields():
-    """A truncated/odd LLM pick must be dropped, not crash."""
-    t = _transcript([("x", 1.0, 1.2)])
+def test_clamp_drops_unformable_and_malformed():
+    t = _transcript([("a", 0, 0.4), ("b", 1, 1.4)])   # no boundaries
     raw = [
-        {"start": 0},                                    # missing end → dropped
-        {"hook_score": 0.5},                             # missing start/end → dropped
-        {"start": 0, "end": 20, "hook_score": 0.7, "reason": "ok"},  # valid
+        {"start": 0},                                  # missing end → dropped
+        {"start": 0, "end": 50, "completeness_score": 0.9, "reason": "x"},  # no boundaries → dropped
     ]
-    out = sp._clamp(raw, t, 30, min_dur=5.0)
-    assert len(out) == 1 and out[0].end == 20
+    assert sp._clamp(raw, t, MIN, MAX) == []
 
 
 # ---------------------------------------------------------------------------
-# _synthesize_from_transcript
+# Synthesis fallback
 # ---------------------------------------------------------------------------
 
-def test_synthesize_covers_speech_window():
-    t = _transcript([("hello", 1.0, 1.5), ("there", 1.6, 2.0), ("friend", 2.1, 2.6)])
-    seg = sp._synthesize_from_transcript(t, max_duration_s=20)
+def test_synthesize_produces_complete_length_window():
+    t = _talk()
+    seg = sp._synthesize_from_transcript(t, MIN, MAX)
     assert seg is not None
-    assert seg.start == 1.0
-    assert seg.end == 2.6
-    assert seg.hook_score == 0.3
-    assert "hello" in seg.transcript
+    assert MIN - 2 <= seg.duration <= MAX
+    assert seg.completeness_score == 0.6
+    assert seg.reason.startswith("Best available")
 
 
-def test_synthesize_caps_at_max_duration():
-    words = [(f"w{i}", float(i), float(i) + 0.4) for i in range(60)]  # 60s of speech
-    seg = sp._synthesize_from_transcript(_transcript(words), max_duration_s=20)
-    assert seg is not None
-    assert seg.end - seg.start <= 20.5
-
-
-def test_synthesize_none_for_empty_transcript():
-    assert sp._synthesize_from_transcript(_transcript([]), 20) is None
+def test_synthesize_none_for_empty():
+    assert sp._synthesize_from_transcript(_transcript([]), MIN, MAX) is None
 
 
 # ---------------------------------------------------------------------------
 # Fallback wiring (LLM mocked)
 # ---------------------------------------------------------------------------
 
-def _mock_resp(payload: dict) -> MagicMock:
+def _resp(payload: dict) -> MagicMock:
     m = MagicMock()
     m.choices = [MagicMock()]
     m.choices[0].message.content = json.dumps(payload)
     return m
 
 
+def _seg(start, end, comp=0.8):
+    return {"start": start, "end": end, "hook_score": 0.8, "value_score": 0.8,
+            "completeness_score": comp, "payoff_score": 0.8, "reason": "complete", "summary": "idea"}
+
+
 @pytest.mark.asyncio
-async def test_strict_pass_returns_when_found():
-    t = _transcript([("contrarian", 10.0, 10.5), ("take", 10.6, 25.0)])
-    strict = _mock_resp({"segments": [
-        {"start": 10, "end": 24, "hook_score": 0.9, "reason": "r", "transcript": "t"}
-    ]})
+async def test_strict_returns_complete_clip():
+    t = _talk()
+    strict = _resp({"segments": [_seg(0, 50, comp=0.85)]})
     with patch.object(sp, "AsyncOpenAI") as oai:
         oai.return_value.chat.completions.create = AsyncMock(return_value=strict)
-        out = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
-    assert len(out) == 1 and out[0].hook_score == 0.9
-
-
-@pytest.mark.asyncio
-async def test_lenient_fallback_used_when_strict_empty():
-    t = _transcript([("mundane", 1.0, 1.5), ("chatter", 1.6, 18.0)])
-    strict = _mock_resp({"segments": []})                       # strict finds nothing
-    lenient = _mock_resp({"segments": [
-        {"start": 1, "end": 17, "hook_score": 0.4, "reason": "best available", "transcript": "t"}
-    ]})
-    with patch.object(sp, "AsyncOpenAI") as oai:
-        oai.return_value.chat.completions.create = AsyncMock(side_effect=[strict, lenient])
-        out = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
+        out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
     assert len(out) == 1
-    assert out[0].hook_score == 0.4
+    assert MIN - 2 <= out[0].duration <= MAX
+    assert out[0].completeness_score == 0.85
 
 
 @pytest.mark.asyncio
-async def test_synthesis_when_all_llm_passes_empty():
-    """All passes (cheap → escalate → lenient) empty → synthesis still yields one."""
-    t = _transcript([("here", 2.0, 2.4), ("we", 2.5, 2.7), ("are", 2.8, 3.2)])
-    empty = _mock_resp({"segments": []})
-    with patch.object(sp, "AsyncOpenAI") as oai:
-        oai.return_value.chat.completions.create = AsyncMock(side_effect=[empty, empty, empty])
-        out = await sp.pick_segments(t, n=1, max_duration_s=20, prompt=None)
-    assert len(out) == 1
-    assert out[0].reason.startswith("Best available")
-
-
-@pytest.mark.asyncio
-async def test_cheap_model_used_first_then_escalates():
-    """Cost tiering: cheap model on the first call; strong model only when empty."""
+async def test_incomplete_clip_filtered_then_escalates():
+    """A low-completeness pick is dropped by the strict bar → escalate model used."""
+    t = _talk()
+    weak = _resp({"segments": [_seg(0, 50, comp=0.4)]})    # below 0.6 strict bar
+    strong = _resp({"segments": [_seg(0, 50, comp=0.75)]})
     from app.config import get_settings
     s = get_settings()
-    t = _transcript([("a", 1.0, 1.4), ("b", 1.5, 18.0)])
-    empty = _mock_resp({"segments": []})
-    found = _mock_resp({"segments": [{"start": 1, "end": 17, "hook_score": 0.8, "reason": "r"}]})
     with patch.object(sp, "AsyncOpenAI") as oai:
-        create = AsyncMock(side_effect=[empty, found])    # cheap empty → escalate finds it
+        create = AsyncMock(side_effect=[weak, strong])
         oai.return_value.chat.completions.create = create
-        out = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
-    assert len(out) == 1
+        out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert len(out) == 1 and out[0].completeness_score == 0.75
     models = [c.kwargs["model"] for c in create.call_args_list]
-    assert models[0] == s.openai_analysis_model       # cheap first
-    assert models[1] == s.openai_escalation_model     # escalated only after empty
+    assert models[0] == s.openai_analysis_model and models[1] == s.openai_escalation_model
+
+
+@pytest.mark.asyncio
+async def test_synthesis_when_all_passes_empty():
+    t = _talk()
+    empty = _resp({"segments": []})
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        oai.return_value.chat.completions.create = AsyncMock(side_effect=[empty, empty, empty])
+        out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert len(out) == 1
+    assert out[0].reason.startswith("Best available")
+    assert MIN - 2 <= out[0].duration <= MAX
 
 
 @pytest.mark.asyncio
 async def test_cache_hit_short_circuits(patched_redis):
-    """A second identical call returns from cache without hitting the LLM."""
-    t = _transcript([("hook", 5.0, 5.4), ("worthy", 5.5, 20.0)])
-    found = _mock_resp({"segments": [{"start": 5, "end": 19, "hook_score": 0.9, "reason": "r"}]})
+    t = _talk()
+    found = _resp({"segments": [_seg(0, 50)]})
     with patch.object(sp, "AsyncOpenAI") as oai:
         create = AsyncMock(return_value=found)
         oai.return_value.chat.completions.create = create
-        first = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
-        calls_after_first = create.call_count
-        second = await sp.pick_segments(t, n=1, max_duration_s=30, prompt=None)
+        first = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+        after = create.call_count
+        second = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
     assert len(first) == 1 and len(second) == 1
-    assert create.call_count == calls_after_first      # no new LLM calls on 2nd run
+    assert create.call_count == after                  # no new LLM call on 2nd run
 
 
 @pytest.mark.asyncio
 async def test_truncated_json_does_not_crash():
-    """The long-video bug: a response truncated mid-string must NOT crash
-    analyze. _safe_segments returns [] → fallback chain → synthesis."""
-    t = _transcript([("here", 1.0, 1.4), ("we", 1.5, 1.7), ("go", 1.8, 2.2)])
+    t = _talk()
     truncated = MagicMock()
     truncated.choices = [MagicMock()]
-    # Unterminated string — exactly the failure seen on the 15-min YouTube talk.
-    truncated.choices[0].message.content = (
-        '{"segments": [{"start": 1, "end": 18, "reason": "an unterminated'
-    )
+    truncated.choices[0].message.content = '{"segments": [{"start": 1, "end": 50, "reason": "an unterminated'
     with patch.object(sp, "AsyncOpenAI") as oai:
         oai.return_value.chat.completions.create = AsyncMock(side_effect=[truncated, truncated, truncated])
-        out = await sp.pick_segments(t, n=1, max_duration_s=20, prompt=None)
-    assert len(out) == 1                      # never zero, never crashes
+        out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert len(out) == 1                               # never zero, never crashes
     assert out[0].reason.startswith("Best available")

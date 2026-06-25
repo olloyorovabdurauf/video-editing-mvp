@@ -38,7 +38,11 @@ class ReelCreateRequest(BaseModel):
         None, max_length=512, description="R2 key from POST /uploads for an uploaded file")
     aspect: AspectRatio = AspectRatio.VERTICAL
     target_count: int = Field(3, ge=1, le=10, description="How many reels to extract")
-    max_duration_s: int = Field(60, ge=10, le=180)
+    # Clips are COMPLETE short-form pieces (full hook→context→value→payoff arc),
+    # not highlight fragments. Default 45-60s so each works as a standalone Reel.
+    max_duration_s: int = Field(60, ge=15, le=180)
+    min_duration_s: int = Field(45, ge=15, le=120,
+                                description="Floor so clips are complete, not 5-10s hooks")
 
     # Quality knobs — sensible defaults that produce a viral-looking reel.
     caption_style: CaptionStyle = "karaoke"
@@ -76,6 +80,12 @@ class ReelCreateRequest(BaseModel):
             raise ValueError("provide exactly one of source_url or upload_key")
         return self
 
+    @model_validator(mode="after")
+    def _sane_durations(self) -> "ReelCreateRequest":
+        if self.min_duration_s > self.max_duration_s:
+            raise ValueError("min_duration_s must be <= max_duration_s")
+        return self
+
     @property
     def is_upload(self) -> bool:
         return self.upload_key is not None
@@ -84,9 +94,20 @@ class ReelCreateRequest(BaseModel):
 class Segment(BaseModel):
     start: float
     end: float
-    hook_score: float = Field(..., ge=0, le=1)
-    reason: str
+    # Per-clip scores (0..1). A clip is selected on a complete-story basis, not
+    # on hook alone: completeness + value matter as much as the hook.
+    hook_score: float = Field(0.0, ge=0, le=1)
+    value_score: float = Field(0.0, ge=0, le=1)
+    completeness_score: float = Field(0.0, ge=0, le=1)
+    payoff_score: float = Field(0.0, ge=0, le=1)
+    score: float = Field(0.0, ge=0, le=1)          # overall, completeness-weighted
+    reason: str = ""                               # why this works as a standalone clip
+    summary: str = ""                              # one line: the complete idea it covers
     transcript: str
+
+    @property
+    def duration(self) -> float:
+        return round(self.end - self.start, 2)
 
 
 class BRollClip(BaseModel):

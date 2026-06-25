@@ -16,7 +16,8 @@ function scoreColor(score: number) {
 }
 
 export function ReelCard({ reel, index }: { reel: ReelArtifact; index: number }) {
-  const score = Math.round(reel.segment.hook_score * 100);
+  const score = Math.round((reel.segment.score ?? reel.segment.hook_score) * 100);
+  const duration = Math.round(reel.segment.end - reel.segment.start);
   const title = reel.title?.trim() || `Clip ${index + 1}`;
   const captionParts = [reel.caption?.trim(), (reel.hashtags || []).map((h) => `#${h}`).join(" ")].filter(Boolean);
   const captionText = captionParts.join("\n\n");
@@ -41,17 +42,24 @@ export function ReelCard({ reel, index }: { reel: ReelArtifact; index: number })
         >
           🔥 {score}
         </div>
-        {/* Timestamp */}
-        <div className="absolute right-2 top-2 rounded-full border border-white/10 bg-black/60 px-2 py-1 font-mono text-[11px] text-white/70 backdrop-blur">
+        {/* Duration */}
+        <div className="absolute right-2 top-2 rounded-full border border-white/10 bg-black/60 px-2 py-1 font-mono text-[11px] font-semibold text-white/80 backdrop-blur">
+          {duration}s
+        </div>
+        {/* Timestamp in original */}
+        <div className="absolute bottom-2 right-2 rounded-full border border-white/10 bg-black/60 px-2 py-1 font-mono text-[11px] text-white/60 backdrop-blur">
           {fmt(reel.segment.start)}–{fmt(reel.segment.end)}
         </div>
       </div>
 
-      {/* Title + why it hooks */}
+      {/* Title + summary + why selected */}
       <div>
         <h3 className="text-sm font-semibold leading-snug text-white">{title}</h3>
-        <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-white/45">
-          <span className="text-white/60">Why it hooks:</span> {reel.segment.reason}
+        {reel.segment.summary && (
+          <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-white/60">{reel.segment.summary}</p>
+        )}
+        <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-white/40">
+          <span className="text-white/55">Why selected:</span> {reel.segment.reason}
         </p>
       </div>
 
