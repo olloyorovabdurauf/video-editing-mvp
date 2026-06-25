@@ -67,10 +67,21 @@ def test_finalize_window_caps_at_max():
     assert end <= 0.0 + MAX + 0.01
 
 
-def test_finalize_window_none_without_boundaries():
-    # No sentence punctuation → can't form a clean window → dropped.
-    t = _transcript([("a", 0, 0.4), ("b", 1, 1.4), ("c", 2, 2.4)])
-    assert sp._finalize_window(t.words, 0, 50, MIN, MAX) is None
+def test_finalize_window_word_fallback_when_no_punctuation():
+    # Whisper words often carry NO sentence punctuation. We must still produce a
+    # 45-60s window aligned to word boundaries — never None, never the whole clip.
+    words = [(f"w{i}", float(i), float(i) + 0.4) for i in range(200)]   # 200s, no '.'
+    win = sp._finalize_window(_transcript(words).words, 30, 90, MIN, MAX)
+    assert win is not None
+    s, e = win
+    assert MIN - 2 <= e - s <= MAX
+
+
+def test_finalize_window_never_returns_whole_video():
+    # The 895s bug: even asking for a huge window, the result is capped at max.
+    words = [(f"w{i}", float(i), float(i) + 0.4) for i in range(900)]   # 900s, no '.'
+    s, e = sp._finalize_window(_transcript(words).words, 0, 900, MIN, MAX)
+    assert e - s <= MAX + 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -91,13 +102,20 @@ def test_clamp_builds_complete_scored_clip():
     assert "w0x0" in seg.transcript                # text filled from our words
 
 
-def test_clamp_drops_unformable_and_malformed():
-    t = _transcript([("a", 0, 0.4), ("b", 1, 1.4)])   # no boundaries
+def test_clamp_drops_malformed_picks():
+    t = _talk()
     raw = [
-        {"start": 0},                                  # missing end → dropped
-        {"start": 0, "end": 50, "completeness_score": 0.9, "reason": "x"},  # no boundaries → dropped
+        {"start": 0},                 # missing end → dropped
+        {"hook_score": 0.5},          # missing start + end → dropped
+        "not a dict",                 # dropped
     ]
     assert sp._clamp(raw, t, MIN, MAX) == []
+
+
+def test_synthesize_never_exceeds_max_without_punctuation():
+    words = [(f"w{i}", float(i), float(i) + 0.4) for i in range(300)]   # 300s, no '.'
+    seg = sp._synthesize_from_transcript(_transcript(words), MIN, MAX)
+    assert seg is not None and seg.duration <= MAX + 0.1   # not the whole 300s
 
 
 # ---------------------------------------------------------------------------

@@ -266,35 +266,50 @@ def _boundaries(words: list[Word]) -> tuple[list[float], list[float]]:
 def _finalize_window(words: list[Word], start: float, end: float,
                      min_s: float, max_s: float) -> tuple[float, float] | None:
     """
-    Snap [start, end] to sentence boundaries and force the duration into
-    [min_s, max_s] by extending to the nearest sentence ends. Returns None if a
-    minimum-length window can't be formed (source genuinely too short here).
+    Force [start, end] into a [min_s, max_s] window aligned to clean cut points.
+
+    Prefers SENTENCE boundaries; falls back to WORD boundaries when Whisper's
+    word timestamps carry no punctuation (very common), and finally to a pure
+    time cut. Critically it NEVER returns the whole video — the end is hard-capped
+    at start+max_s. Returns None only for an essentially-empty transcript.
     """
     if len(words) < 2:
         return None
     t0, t1 = words[0].start, words[-1].end
-    starts, ends = _boundaries(words)
-    if not starts or not ends:
-        return None
+    total = t1 - t0
+    eff_min = min(min_s, total)                  # source shorter than the floor → whole thing
 
     start = max(t0, min(start, t1))
-    # Snap start back to the sentence start at/just before the requested start.
-    cand = [s for s in starts if s <= start + 0.4]
+    sent_starts, sent_ends = _boundaries(words)
+    word_starts = [w.start for w in words]
+    word_ends = [w.end for w in words]
+
+    # Snap START to a sentence start if available, else the nearest word start.
+    cand = [s for s in sent_starts if s <= start + 0.4] or \
+           [w for w in word_starts if w <= start + 0.2]
     start = max(cand) if cand else t0
 
-    target_end = max(end, start + min_s)
-    # Prefer a sentence-end that lands the duration inside [min_s, max_s].
-    in_range = [e for e in ends if min_s <= (e - start) <= max_s]
-    if in_range:
-        # closest sentence-end to the model's requested end
-        end = min(in_range, key=lambda e: abs(e - target_end))
-    else:
-        under = [e for e in ends if (e - start) <= max_s and e > start]
-        end = max(under) if under else min(start + max_s, t1)
+    target_end = min(t1, max(end, start + eff_min))
 
-    end = min(end, t1, start + max_s)
-    dur = end - start
-    if dur < min(min_s, t1 - t0) - 2.0:
+    def _pick_end(boundaries: list[float]) -> float | None:
+        in_range = [b for b in boundaries if eff_min <= (b - start) <= max_s]
+        if in_range:
+            return min(in_range, key=lambda b: abs(b - target_end))
+        under = [b for b in boundaries if start < b <= start + max_s]
+        return max(under) if under else None
+
+    # END: prefer sentence ends, then word ends, then a hard time cut.
+    end = _pick_end(sent_ends) if sent_ends else None
+    if end is None:
+        end = _pick_end(word_ends)
+    if end is None:
+        end = min(start + max_s, t1)
+
+    end = min(end, t1, start + max_s)            # HARD CAP — never the whole video
+    if end - start < eff_min - 2.0:              # snapped too short → extend by time
+        end = min(t1, start + max_s)
+
+    if end - start < min(eff_min, total) - 2.0:
         return None
     return (round(start, 2), round(end, 2))
 
@@ -343,7 +358,10 @@ def _synthesize_from_transcript(transcript: Transcript, min_s: int, max_s: int) 
         return None
     win = _finalize_window(words, words[0].start, words[0].start + max_s, float(min_s), float(max_s))
     if win is None:
-        ws, we = words[0].start, words[-1].end           # whole (short) clip
+        # Degenerate transcript — take from the start but HARD-CAP at max_s so we
+        # never emit the whole video as a single clip (the 895s-clip bug).
+        ws = words[0].start
+        we = min(words[-1].end, ws + max_s)
     else:
         ws, we = win
     text = _text_in_window(transcript, ws, we)

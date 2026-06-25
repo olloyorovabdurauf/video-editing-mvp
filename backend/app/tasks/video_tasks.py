@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 
@@ -43,10 +44,19 @@ def _key(job_id: str) -> str:
     return f"job:{job_id}"
 
 
+_NON_TERMINAL = {"queued", "downloading", "transcribing", "analyzing",
+                 "generating_broll", "rendering"}
+# If a non-terminal job hasn't advanced in this long, treat it as dead (the
+# worker was killed by a deploy/restart, or a stage hung). A streaming render
+# updates state every clip (~1-3 min), so this won't false-positive a slow job.
+_STALE_AFTER_S = 12 * 60
+
+
 def _update(job_id: str, **patch) -> None:
     raw = r.get(_key(job_id))
     state = json.loads(raw) if raw else {"job_id": job_id, "artifacts": []}
     state.update(patch)
+    state["updated_at"] = time.time()        # heartbeat for the stale-job guard
     r.setex(_key(job_id), 60 * 60 * 24, json.dumps(state))
 
 
@@ -54,7 +64,15 @@ def get_job(job_id: str) -> ReelJobResponse | None:
     raw = r.get(_key(job_id))
     if not raw:
         return None
-    return ReelJobResponse(**json.loads(raw))
+    state = json.loads(raw)
+    # Fail orphaned/hung jobs instead of letting the UI spin forever.
+    if state.get("status") in _NON_TERMINAL:
+        last = state.get("updated_at") or state.get("created_at") or 0
+        if last and (time.time() - last) > _STALE_AFTER_S:
+            state["status"] = ReelJobStatus.FAILED.value
+            state["message"] = "Processing stopped unexpectedly (the server may have restarted). Please try again."
+            r.setex(_key(job_id), 60 * 60 * 24, json.dumps(state))
+    return ReelJobResponse(**state)
 
 
 def get_job_owner(job_id: str) -> str | None:
