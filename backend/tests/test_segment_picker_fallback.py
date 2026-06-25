@@ -187,9 +187,8 @@ async def test_synthesis_when_all_passes_empty():
     with patch.object(sp, "AsyncOpenAI") as oai:
         oai.return_value.chat.completions.create = AsyncMock(side_effect=[empty, empty, empty])
         out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
-    assert len(out) == 1
-    assert out[0].reason.startswith("Best available")
-    assert MIN - 2 <= out[0].duration <= MAX
+    assert len(out) >= 1                          # never zero
+    assert MIN - 2 <= out[0].duration <= MAX      # a sized clip, never the whole video
 
 
 @pytest.mark.asyncio
@@ -238,6 +237,24 @@ async def test_accumulates_distinct_clips_toward_n():
 
 
 @pytest.mark.asyncio
+async def test_distributes_to_n_when_ai_underdelivers_on_long_video():
+    # The real-world bug: long video, AI keeps returning 1 → distribution fills
+    # to n with complete windows spread across the timeline.
+    words = [(f"w{i}", round(i * 0.5, 2), round(i * 0.5 + 0.42, 2)) for i in range(720)]  # ~360s
+    t = _transcript(words)
+    one = _resp({"segments": [_seg(0, 55)]})   # AI returns the same single clip every pass
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        oai.return_value.chat.completions.create = AsyncMock(return_value=one)
+        out = await sp.pick_segments(t, n=3, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert len(out) == 3                        # guaranteed N on a 360s source
+    assert all(MIN - 2 <= s.duration <= MAX for s in out)
+    starts = [s.start for s in out]
+    assert starts == sorted(starts)
+    for a, b in zip(out, out[1:]):
+        assert a.end <= b.start + 1             # non-overlapping
+
+
+@pytest.mark.asyncio
 async def test_stops_escalating_once_n_met():
     t = _talk(sentences=16)
     cheap = _resp({"segments": [_seg(0, 50), _seg(60, 110), _seg(115, 160)]})  # 3 at once
@@ -258,5 +275,5 @@ async def test_truncated_json_does_not_crash():
     with patch.object(sp, "AsyncOpenAI") as oai:
         oai.return_value.chat.completions.create = AsyncMock(side_effect=[truncated, truncated, truncated])
         out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
-    assert len(out) == 1                               # never zero, never crashes
-    assert out[0].reason.startswith("Best available")
+    assert len(out) >= 1                               # never zero, never crashes
+    assert MIN - 2 <= out[0].duration <= MAX

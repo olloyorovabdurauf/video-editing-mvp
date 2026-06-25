@@ -168,21 +168,27 @@ async def pick_segments(
     try:
         logger.info("clip analysis (cheap={}) target n={} {}-{}s on {} chars",
                     settings.openai_analysis_model, n, min_eff, max_duration_s, len(compressed))
-        out = await _ask(settings.openai_analysis_model, strict, 0.4, min_completeness=0.6)
+        out = await _ask(settings.openai_analysis_model, strict, 0.4, min_completeness=0.5)
         # Escalate whenever we're SHORT of the requested count — not only at zero.
         # This is the "user asked for 5, got 1" fix: keep gathering distinct clips
         # until we reach n (or the video genuinely runs out of complete material).
         if len(_dedupe_overlap(out)) < n:
             logger.info("cheap pass gave {}/{} → escalating to {}",
                         len(out), n, settings.openai_escalation_model)
-            out = _merge(out, await _ask(settings.openai_escalation_model, strict, 0.5, min_completeness=0.6))
+            out = _merge(out, await _ask(settings.openai_escalation_model, strict, 0.5, min_completeness=0.5))
         if len(_dedupe_overlap(out)) < n:
             logger.info("still short ({}/{}) → relaxed fill pass", len(_dedupe_overlap(out)), n)
-            out = _merge(out, await _ask(settings.openai_escalation_model, fill, 0.6, min_completeness=0.45))
+            out = _merge(out, await _ask(settings.openai_escalation_model, fill, 0.6, min_completeness=0.4))
     except Exception as e:
         logger.warning("segment analysis failed: {}", e)
 
     out = _dedupe_overlap(out)                 # drop near-duplicate / overlapping windows
+    # Guarantee the requested count on a long-enough video: if the AI under-
+    # delivered, take complete 45-60s windows from evenly-spaced regions it didn't
+    # already cover. A human editor does the same — one from each part of the talk.
+    if len(out) < n:
+        logger.info("AI gave {}/{} → distributing clips across the timeline", len(out), n)
+        out = _dedupe_overlap(_distribute_clips(transcript, out, n, min_eff, max_duration_s))
     out.sort(key=lambda x: x.score, reverse=True)
     out = out[:n]
     out.sort(key=lambda x: x.start)            # chronological order for the user
@@ -285,9 +291,14 @@ def _finalize_window(words: list[Word], start: float, end: float,
     word_starts = [w.start for w in words]
     word_ends = [w.end for w in words]
 
-    # Snap START to a sentence start if available, else the nearest word start.
-    cand = [s for s in sent_starts if s <= start + 0.4] or \
-           [w for w in word_starts if w <= start + 0.2]
+    # Snap START to the nearest clean boundary at/just before the requested start.
+    # Prefer a sentence start, but only if one began RECENTLY (within max_s) —
+    # otherwise a single trivial sentence-start at t=0 (no punctuation in the
+    # transcript) would drag every window back to the beginning. Else use the
+    # nearest word start.
+    sent_cand = [s for s in sent_starts if start - max_s <= s <= start + 0.4]
+    word_cand = [w for w in word_starts if w <= start + 0.2]
+    cand = sent_cand or word_cand
     start = max(cand) if cand else t0
 
     target_end = min(t1, max(end, start + eff_min))
@@ -374,3 +385,47 @@ def _synthesize_from_transcript(transcript: Transcript, min_s: int, max_s: int) 
         summary=(text[:120] + "…") if len(text) > 120 else text,
         transcript=text,
     )
+
+
+def _distribute_clips(transcript: Transcript, have: list[Segment], n: int,
+                      min_s: int, max_s: int) -> list[Segment]:
+    """
+    Fill up to `n` clips by taking a complete 45-60s window from evenly-spaced
+    regions of the video that aren't already covered. Guarantees the requested
+    count on a long-enough source — a human editor pulls one clip from each part
+    of a talk rather than returning a single highlight.
+    """
+    words = transcript.words
+    if not words or len(have) >= n:
+        return have
+    t0, t1 = words[0].start, words[-1].end
+    total = t1 - t0
+    if total < min_s:                       # too short to add anything meaningful
+        return have
+
+    kept = list(have)
+    step = total / n
+    for k in range(n):
+        if len(kept) >= n:
+            break
+        rstart = t0 + k * step
+        win = _finalize_window(words, rstart, rstart + max_s, float(min_s), float(max_s))
+        if win is None:
+            continue
+        ws, we = win
+        overlaps = any(
+            (min(we, c.end) - max(ws, c.start)) > 0.4 * min(we - ws, c.end - c.start)
+            for c in kept
+        )
+        if overlaps:
+            continue
+        text = _text_in_window(transcript, ws, we)
+        kept.append(Segment(
+            start=round(ws, 2), end=round(we, 2),
+            hook_score=0.45, value_score=0.5, completeness_score=0.55, payoff_score=0.45,
+            score=round(_W_HOOK * 0.45 + _W_VALUE * 0.5 + _W_COMPLETE * 0.55 + _W_PAYOFF * 0.45, 3),
+            reason="A complete section from this part of the video.",
+            summary=(text[:120] + "…") if len(text) > 120 else text,
+            transcript=text,
+        ))
+    return kept
