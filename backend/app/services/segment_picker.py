@@ -134,7 +134,8 @@ async def pick_segments(
     total = transcript.words[-1].end - transcript.words[0].start
     min_eff = min(min_duration_s, int(total))
 
-    ck = ai_cache.key("segpick_v2", compressed, n, min_eff, max_duration_s, prompt or "")
+    # v3: invalidates clips cached before the whole-video / word-boundary fix.
+    ck = ai_cache.key("segpick_v3", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
