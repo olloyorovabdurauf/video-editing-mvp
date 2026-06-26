@@ -116,13 +116,51 @@ def _on_task_failure(sender=None, task_id=None, exception=None, **kw):
         _update(job_id,
                 status=ReelJobStatus.FAILED.value,
                 message=f"{sender.name if sender else 'unknown'}: {exception}")
+        _purge_job_files(job_id)        # don't leak the download of a failed job
     except Exception as e:
-        logger.warning("failure-handler couldn't refund: {}", e)
+        logger.warning("failure-handler couldn't refund/clean: {}", e)
 
 
 def _run(coro):
     """Bridge async helpers into sync Celery tasks (one loop per task call)."""
     return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# Disk hygiene — the storage volume is finite (no R2 yet). raw/ + intermediate/
+# are transient (never needed once a job ends); output/ holds served reels.
+# ---------------------------------------------------------------------------
+
+def _purge_job_files(job_id: str) -> None:
+    """Delete every on-disk trace of one job (used when a job fails)."""
+    import shutil
+    base = settings.storage_local_dir
+    for sub in ("raw", "intermediate", "output"):
+        shutil.rmtree(base / sub / job_id, ignore_errors=True)
+
+
+def _sweep_storage(*, transient_age_h: int = 2, output_age_days: int = 7) -> None:
+    """
+    Bound disk usage so the volume can't fill (the "No space left on device" bug).
+    raw/ + intermediate/ older than a couple hours are leftovers from finished or
+    dead jobs → always safe to delete. output/ is kept `output_age_days` so users
+    can still fetch recent reels (permanent storage arrives with R2). Best-effort.
+    """
+    import shutil
+    base = settings.storage_local_dir
+    now = time.time()
+    rules = (("raw", transient_age_h * 3600), ("intermediate", transient_age_h * 3600),
+             ("output", output_age_days * 86400))
+    for sub, max_age in rules:
+        d = base / sub
+        if not d.exists():
+            continue
+        for child in d.iterdir():
+            try:
+                if now - child.stat().st_mtime > max_age:
+                    shutil.rmtree(child, ignore_errors=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +183,10 @@ def _run(coro):
 def t_download(self, job_id: str, payload: dict) -> dict:
     req = ReelCreateRequest(**payload)
     _update(job_id, status=ReelJobStatus.DOWNLOADING.value, progress=0.05)
+
+    # Reclaim disk before pulling a fresh (possibly 500MB+) download, so the
+    # volume can't fill from leftovers of old/failed jobs.
+    _sweep_storage()
 
     work = settings.storage_local_dir / "raw" / job_id
     work.mkdir(parents=True, exist_ok=True)

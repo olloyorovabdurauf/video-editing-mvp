@@ -38,7 +38,7 @@ primary_region = "fra"          # close to the user (Central Asia → Frankfurt)
 [mounts]
   source = "reelforge_data"
   destination = "/app/storage"
-  initial_size = "10gb"
+  initial_size = "40gb"          # extended from 10gb; downloads+reels are large until R2
 
 [[vm]]
   # DEDICATED CPUs: render is libx264-bound. shared-cpu-2x throttles under load
