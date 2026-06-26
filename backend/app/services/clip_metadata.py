@@ -42,11 +42,54 @@ transcript and why it hooks. For EACH clip return:
     value, then a clear CTA
   - "hashtags": 4-6 relevant hashtags (no # symbol needed)
 
-Write everything in the SAME LANGUAGE as that clip's transcript (do not
-translate). Return STRICT JSON only:
-{"clips": [{"title": "...", "caption": "...", "hashtags": ["..."]}, ...]}
+{lang_directive}
+
+Return STRICT JSON only:
+{{"clips": [{{"title": "...", "caption": "...", "hashtags": ["..."]}}, ...]}}
 The clips array MUST be in the same order and length as the input.
 """
+
+# ISO-639-1 → human name for the language lock.
+_LANG_NAMES = {
+    "uz": "Uzbek (Latin alphabet)", "en": "English", "ru": "Russian",
+    "kk": "Kazakh", "ar": "Arabic", "tr": "Turkish", "es": "Spanish",
+    "fr": "French", "de": "German", "pt": "Portuguese", "hi": "Hindi",
+}
+
+
+def _lang_directive(language: str | None) -> str:
+    if not language:
+        return ("Write everything in the SAME LANGUAGE as the clip's transcript. "
+                "Do NOT translate or switch languages.")
+    name = _LANG_NAMES.get(language, language)
+    extra = ""
+    if language == "uz":
+        extra = (" Use natural Uzbek in the LATIN alphabet — NOT Cyrillic, NOT Arabic "
+                 "script, and NOT Kazakh/Turkish. Correct: "
+                 "\"Bugungi kunda sun'iy intellekt juda tez rivojlanmoqda\".")
+    return (f"Write EVERYTHING (title, caption, hashtags) ONLY in {name}. "
+            f"NEVER translate. NEVER switch to another language.{extra}")
+
+
+def _has_range(text: str, lo: int, hi: int) -> bool:
+    return any(lo <= ord(c) <= hi for c in text)
+
+
+def _wrong_language(text: str, language: str | None) -> bool:
+    """Cheap script check that catches the common failures (uz→Cyrillic/Arabic)."""
+    if not text or not language:
+        return False
+    cyrillic = _has_range(text, 0x0400, 0x04FF)
+    arabic = _has_range(text, 0x0600, 0x06FF)
+    if language == "uz":
+        return cyrillic or arabic          # Uzbek must be Latin
+    if language in ("ru", "kk"):
+        return not cyrillic                 # must be Cyrillic
+    if language == "ar":
+        return not arabic
+    if language == "en":
+        return cyrillic or arabic
+    return False
 
 
 def _make_client() -> AsyncOpenAI:
@@ -80,27 +123,7 @@ def _user_payload(clips: list[ClipInput]) -> str:
     return "\n\n".join(lines)
 
 
-async def generate_for_clips(clips: list[ClipInput]) -> list[ClipMeta]:
-    """Title + caption + hashtags per clip. Always returns one ClipMeta per input."""
-    if not clips:
-        return []
-    settings = get_settings()
-    fallbacks = [_fallback(c) for c in clips]
-
-    try:
-        content = await _call_llm(
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _user_payload(clips)},
-            ],
-            model=settings.openai_analysis_model,   # cheap model — light copywriting
-            max_tokens=1200,
-        )
-        raw = json.loads(content).get("clips", [])
-    except Exception as e:                            # network / parse error
-        logger.warning("clip metadata generation failed, using fallbacks: {}", e)
-        return fallbacks
-
+def _assemble(raw: list, fallbacks: list[ClipMeta]) -> list[ClipMeta]:
     out: list[ClipMeta] = []
     for i, fb in enumerate(fallbacks):
         item = raw[i] if i < len(raw) and isinstance(raw[i], dict) else {}
@@ -109,3 +132,39 @@ async def generate_for_clips(clips: list[ClipInput]) -> list[ClipMeta]:
         hashtags = [str(h).lstrip("#") for h in (item.get("hashtags") or []) if str(h).strip()][:8]
         out.append(ClipMeta(title=title[:120], caption=caption[:500], hashtags=hashtags))
     return out
+
+
+async def generate_for_clips(clips: list[ClipInput], *, language: str | None = None) -> list[ClipMeta]:
+    """
+    Title + caption + hashtags per clip, LOCKED to `language` (the source video's
+    language). Always returns one ClipMeta per input. If the model answers in the
+    wrong script (e.g. Cyrillic for Uzbek), regenerate once with a sharper nudge.
+    """
+    if not clips:
+        return []
+    settings = get_settings()
+    fallbacks = [_fallback(c) for c in clips]
+    system = SYSTEM_PROMPT.format(lang_directive=_lang_directive(language))
+    user = _user_payload(clips)
+
+    metas = fallbacks
+    for attempt in (1, 2):
+        try:
+            content = await _call_llm(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                model=settings.openai_analysis_model,   # cheap model — light copywriting
+                max_tokens=1200,
+            )
+            raw = json.loads(content).get("clips", [])
+        except Exception as e:                           # network / parse error → fallback
+            logger.warning("clip metadata generation failed, using fallbacks: {}", e)
+            return fallbacks
+
+        metas = _assemble(raw, fallbacks)
+        wrong = language and any(_wrong_language(f"{m.title} {m.caption}", language) for m in metas)
+        if not wrong:
+            return metas
+        logger.warning("clip metadata in wrong language (expected {}) → regenerating", language)
+        system = system + (f"\n\nYOUR PREVIOUS OUTPUT WAS IN THE WRONG LANGUAGE. Output ONLY in "
+                           f"{_LANG_NAMES.get(language, language)}. Do it again, correctly.")
+    return metas                                          # accept best effort after one retry

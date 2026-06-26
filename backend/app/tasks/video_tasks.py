@@ -169,8 +169,10 @@ def t_download(self, job_id: str, payload: dict) -> dict:
 @shared_task(name="pipeline.transcribe", queue="ai", bind=True, max_retries=2)
 def t_transcribe(self, ctx: dict) -> dict:
     _update(ctx["job_id"], status=ReelJobStatus.TRANSCRIBING.value, progress=0.20)
+    # User-locked source language (forces Whisper) or auto-detect.
+    lang = (ctx.get("payload") or {}).get("language") or None
     try:
-        transcript = _run(transcription.transcribe(Path(ctx["source_path"])))
+        transcript = _run(transcription.transcribe(Path(ctx["source_path"]), language=lang))
     except transcription.VideoTooLong as e:
         # Permanent — retrying won't help. Fail the job with a user-facing message.
         logger.warning("transcription rejected: {}", e)
@@ -189,7 +191,9 @@ def t_transcribe(self, ctx: dict) -> dict:
     }), encoding="utf-8")
 
     audio_minutes = round((transcript.words[-1].end / 60.0) if transcript.words else 0.0, 2)
-    return {**ctx, "transcript_path": str(tpath), "audio_minutes": audio_minutes}
+    # Lock the language for all downstream text (captions/titles) to the source.
+    return {**ctx, "transcript_path": str(tpath), "audio_minutes": audio_minutes,
+            "source_language": transcript.language}
 
 
 @shared_task(name="pipeline.analyze", queue="ai", bind=True, max_retries=2)
@@ -470,7 +474,8 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
     # caption + hashtags). Best-effort — a metadata hiccup never drops the clip.
     try:
         metas = await clip_metadata.generate_for_clips(
-            [clip_metadata.ClipInput(transcript=seg.transcript, reason=seg.reason)])
+            [clip_metadata.ClipInput(transcript=seg.transcript, reason=seg.reason)],
+            language=ctx.get("source_language"))
         if metas:
             art.title, art.caption, art.hashtags = metas[0].title, metas[0].caption, metas[0].hashtags
     except Exception as e:

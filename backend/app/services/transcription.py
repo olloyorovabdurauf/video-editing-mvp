@@ -79,22 +79,31 @@ def _wav_duration_s(path: Path) -> float:
 
 
 async def _transcribe_file(client: AsyncOpenAI, path: Path, *, offset: float,
-                           model: str) -> Transcript:
-    """Transcribe one (≤limit) audio file; shift word timestamps by `offset`."""
+                           model: str, language: str | None = None) -> Transcript:
+    """Transcribe one (≤limit) audio file; shift word timestamps by `offset`.
+
+    `language` (ISO-639-1, e.g. "uz") FORCES Whisper to transcribe in that
+    language — critical for low-resource languages like Uzbek that Whisper
+    otherwise mis-detects as Kazakh/Russian. None = auto-detect.
+    """
+    extra = {"language": language} if language else {}
     with path.open("rb") as f:
         resp = await client.audio.transcriptions.create(
             model=model, file=f,
             response_format="verbose_json",
             timestamp_granularities=["word"],
+            **extra,
         )
     words = [
         Word(text=w.word, start=w.start + offset, end=w.end + offset)
         for w in (resp.words or [])
     ]
-    return Transcript(language=resp.language or "en", text=resp.text or "", words=words)
+    # When forced, trust the requested language over Whisper's echo.
+    lang = language or resp.language or "en"
+    return Transcript(language=lang, text=resp.text or "", words=words)
 
 
-async def transcribe(video_path: Path) -> Transcript:
+async def transcribe(video_path: Path, *, language: str | None = None) -> Transcript:
     settings = get_settings()
     # Generous per-request timeout: a 10-min chunk upload + transcription.
     client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=300.0)
@@ -117,9 +126,10 @@ async def transcribe(video_path: Path) -> Transcript:
 
     # --- Small enough: one request. ---
     if size <= _DIRECT_LIMIT_BYTES:
-        logger.info("transcribing {} ({:.1f}MB) in one request", wav.name, size / 1e6)
+        logger.info("transcribing {} ({:.1f}MB) in one request (lang={})",
+                    wav.name, size / 1e6, language or "auto")
         try:
-            return await _transcribe_file(client, wav, offset=0.0, model=model)
+            return await _transcribe_file(client, wav, offset=0.0, model=model, language=language)
         finally:
             wav.unlink(missing_ok=True)
 
@@ -144,7 +154,7 @@ async def transcribe(video_path: Path) -> Transcript:
 
     async def _do(chunk: Path, offset: float) -> Transcript:
         async with sem:
-            return await _transcribe_file(client, chunk, offset=offset, model=model)
+            return await _transcribe_file(client, chunk, offset=offset, model=model, language=language)
 
     try:
         # gather preserves order → results stay chunk-ordered.
@@ -156,5 +166,5 @@ async def transcribe(video_path: Path) -> Transcript:
 
     all_words = [w for r in results for w in r.words]
     texts = [r.text for r in results if r.text]
-    language = next((r.language for r in results if r.language), "en")
-    return Transcript(language=language, text=" ".join(texts), words=all_words)
+    detected = language or next((r.language for r in results if r.language), "en")
+    return Transcript(language=detected, text=" ".join(texts), words=all_words)

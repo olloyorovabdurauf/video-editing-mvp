@@ -102,7 +102,7 @@ async def test_large_file_is_chunked_and_offsets_stitched(tmp_path, monkeypatch)
 
     # Each chunk transcription returns one word at local t=1.0; _transcribe_file
     # itself applies the offset, so mock it to honor the offset arg.
-    async def fake_tf(client, path, *, offset, model):
+    async def fake_tf(client, path, *, offset, model, language=None):
         return Transcript("en", f"chunk@{offset:.0f}", [Word("w", 1.0 + offset, 2.0 + offset)])
     with patch.object(tr, "_transcribe_file", side_effect=fake_tf) as mock_tf, \
          patch.object(tr, "AsyncOpenAI"):

@@ -28,6 +28,86 @@ from loguru import logger
 from app.config import get_settings
 
 # ---------------------------------------------------------------------------
+# Encoder selection — GPU (NVENC) when available, CPU (libx264) otherwise.
+# Detected ONCE per process and cached. Nothing else in the codebase hardcodes
+# the codec; everything goes through video_encoder_args() so moving to a GPU
+# host is zero code change.
+# ---------------------------------------------------------------------------
+
+import functools          # noqa: E402
+import subprocess         # noqa: E402
+from abc import ABC, abstractmethod   # noqa: E402
+
+
+class VideoEncoder(ABC):
+    """Strategy for the video codec + quality flags. One impl per backend so the
+    rest of the pipeline never hardcodes libx264/nvenc — `select_encoder()` picks
+    the right one and moving to a GPU host is zero code change."""
+
+    name: str
+
+    @abstractmethod
+    def output_args(self, crf: int) -> list[str]:
+        """ffmpeg output args for a constant-quality encode at `crf`."""
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class CPUEncoder(VideoEncoder):
+    """libx264 software encoding — universal fallback."""
+    name = "libx264 (CPU)"
+
+    def output_args(self, crf: int) -> list[str]:
+        return ["-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", str(crf)]
+
+
+class GPUEncoder(VideoEncoder):
+    """NVIDIA NVENC hardware encoding — used automatically when a GPU is present."""
+    name = "h264_nvenc (GPU)"
+
+    def output_args(self, crf: int) -> list[str]:
+        # NVENC: -cq is the CRF-equivalent constant-quality control; p4 = balanced.
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+
+
+@functools.lru_cache(maxsize=1)
+def _nvenc_available() -> bool:
+    """
+    True only if ffmpeg has h264_nvenc AND it actually initializes (driver + GPU
+    present). We do a tiny throwaway encode so a binary that merely *compiled in*
+    nvenc on a GPU-less host correctly reports False.
+    """
+    s = get_settings()
+    if (s.ffmpeg_hwaccel or "").lower() in ("none", "cpu"):       # explicit CPU override
+        return False
+    try:
+        enc = subprocess.run([s.ffmpeg_binary, "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=10)
+        if "h264_nvenc" not in (enc.stdout or ""):
+            return False
+        test = subprocess.run(
+            [s.ffmpeg_binary, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=128x128:d=0.1",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=20)
+        return test.returncode == 0
+    except Exception as e:
+        logger.info("NVENC probe failed ({}); using CPU encoder", e)
+        return False
+
+
+def select_encoder() -> VideoEncoder:
+    """Pick GPU when available, else CPU. Detection is cached; selection is cheap."""
+    return GPUEncoder() if _nvenc_available() else CPUEncoder()
+
+
+def video_encoder_args(crf: int = 20) -> list[str]:
+    """Convenience: codec/quality args from the selected encoder."""
+    return select_encoder().output_args(crf)
+
+
+# ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
 
@@ -376,8 +456,7 @@ async def cut(
         .with_output(dst)
     )
     if reencode:
-        builder.add_output_args("-c:v", "libx264", "-preset", get_settings().ffmpeg_preset,
-                                "-crf", "20", "-c:a", "aac", "-b:a", "128k")
+        builder.add_output_args(*video_encoder_args(20), "-c:a", "aac", "-b:a", "128k")
     else:
         builder.add_output_args("-c", "copy", "-avoid_negative_ts", "make_zero")
     return await run(builder)
@@ -408,7 +487,7 @@ async def reframe_to_vertical(
         .add_input(src)
         .with_filter_complex(filt)
         .add_output_args(
-            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", str(crf),
+            *video_encoder_args(crf),
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
         )
@@ -466,7 +545,7 @@ async def overlay_broll(
         .with_filter_complex(filt)
         .add_output_args(
             "-map", "[v]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", "20",
+            *video_encoder_args(20),
             "-c:a", "copy",
         )
         .with_output(dst)
@@ -523,7 +602,7 @@ async def overlay_with_dissolve(
         .with_filter_complex(filt)
         .add_output_args(
             "-map", "[v]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", "20",
+            *video_encoder_args(20),
             "-c:a", "copy",
         )
         .with_output(dst)
@@ -546,7 +625,7 @@ async def burn_ass(src: Path, ass: Path, dst: Path) -> Path:
         .add_input(src)
         .with_filter_complex(filt)
         .add_output_args(
-            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", "20",
+            *video_encoder_args(20),
             "-c:a", "copy",
         )
         .with_output(dst)

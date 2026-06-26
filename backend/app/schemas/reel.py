@@ -46,6 +46,13 @@ class ReelCreateRequest(BaseModel):
 
     # Quality knobs — sensible defaults that produce a viral-looking reel.
     caption_style: CaptionStyle = "karaoke"
+    # Source language lock (ISO-639-1: uz/en/ru/kk/ar/…). None = auto-detect.
+    # Forces Whisper to transcribe in this language (fixes Uzbek mis-detected as
+    # Kazakh) and locks captions/titles to it. Captions ALWAYS match this.
+    language: str | None = Field(
+        default=None, max_length=5,
+        description="Force the source/caption language, e.g. 'uz'. None = auto-detect.",
+    )
     smart_crop: bool = Field(True, description="Face-tracking pan-and-scan vs naive center")
     add_music: bool = True
 

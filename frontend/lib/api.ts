@@ -23,6 +23,7 @@ export interface ReelCreateRequest {
   max_duration_s: number;
   min_duration_s: number;
   caption_style: CaptionStyle;
+  language?: string | null;      // source/caption language lock; omit for auto-detect
   smart_crop: boolean;
   add_broll: boolean;            // stock (Pexels) — free
   add_music: boolean;
@@ -128,7 +129,17 @@ export async function createReel(body: ReelCreateRequest): Promise<JobResponse> 
     headers: { "content-type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`createReel failed: ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    // Throw a typed error so the UI shows the REAL reason (out of credits,
+    // rate-limited, bad URL) instead of a generic "network hiccup".
+    let detail = "";
+    try {
+      detail = (await r.json())?.detail ?? "";
+    } catch {
+      /* non-JSON body */
+    }
+    throw new ApiError(r.status, detail || `Request failed (${r.status})`);
+  }
   return r.json();
 }
 

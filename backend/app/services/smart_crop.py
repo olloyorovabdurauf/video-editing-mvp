@@ -200,7 +200,7 @@ async def smart_crop_to_vertical(
         .add_input(src)
         .with_filter_complex(filt)
         .add_output_args(
-            "-c:v", "libx264", "-preset", get_settings().ffmpeg_preset, "-crf", str(crf),
+            *ff.video_encoder_args(crf),
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
         )

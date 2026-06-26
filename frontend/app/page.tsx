@@ -7,6 +7,15 @@ import { ApiError, createReel } from "@/lib/api";
 
 const CLIP_COUNTS = [3, 5, 8];
 
+const LANGUAGES = [
+  { value: "auto", label: "Auto-detect" },
+  { value: "uz", label: "O'zbek" },
+  { value: "en", label: "English" },
+  { value: "ru", label: "Русский" },
+  { value: "kk", label: "Қазақша" },
+  { value: "ar", label: "العربية" },
+];
+
 const HOW_IT_WORKS = [
   { icon: "🎧", title: "Analyzes", desc: "Transcribes & understands the whole video" },
   { icon: "✨", title: "Finds highlights", desc: "Scores the most viral-worthy moments" },
@@ -31,6 +40,7 @@ export default function HomePage() {
 
   const [url, setUrl] = useState("");
   const [count, setCount] = useState(3);
+  const [language, setLanguage] = useState("auto");
   const [captions, setCaptions] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -52,6 +62,7 @@ export default function HomePage() {
         target_count: count,
         min_duration_s: 45,
         max_duration_s: 60,
+        language: language === "auto" ? undefined : language,
         caption_style: captions ? "karaoke" : "none",
         smart_crop: true,
         add_broll: true,
@@ -109,6 +120,21 @@ export default function HomePage() {
 
         {/* Minimal options */}
         <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
+          <div>
+            <span className="label">Language</span>
+            <select
+              value={language}
+              onChange={(e) => setLanguage(e.target.value)}
+              className="input h-9 w-40 py-0 text-sm"
+              title="Captions always match this. Pick your video's language for best accuracy."
+            >
+              {LANGUAGES.map((l) => (
+                <option key={l.value} value={l.value}>
+                  {l.label}
+                </option>
+              ))}
+            </select>
+          </div>
           <div>
             <span className="label">Clips</span>
             <div className="flex gap-2">
