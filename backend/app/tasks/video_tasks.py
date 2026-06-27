@@ -249,8 +249,11 @@ def t_transcribe(self, ctx: dict) -> dict:
 
     audio_minutes = round((transcript.words[-1].end / 60.0) if transcript.words else 0.0, 2)
     # Lock the language for all downstream text (captions/titles) to the source.
+    # If the user asked for a language Whisper CAN'T produce (e.g. Uzbek, which it
+    # transcribes as Kazakh), flag that captions + titles must be TRANSLATED.
+    translate_to = lang if (lang and lang not in transcription._WHISPER_LANGS) else None
     return {**ctx, "transcript_path": str(tpath), "audio_minutes": audio_minutes,
-            "source_language": transcript.language}
+            "source_language": transcript.language, "translate_to": translate_to}
 
 
 @shared_task(name="pipeline.analyze", queue="ai", bind=True, max_retries=2)
@@ -426,11 +429,16 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
     """One clip's pipeline: cut → reframe → b-roll → captions → music → upload →
     metadata. Mirrors the old loop body but fully awaitable so clips run in
     parallel under the semaphore."""
+    from app.services import captions as captions_mod
     from app.services import clip_metadata
     from app.services import music as music_svc
+    from app.services import translation
     from app.services.captions import write_ass
     from app.services.smart_crop import smart_crop_to_vertical
     from app.services.storage import get_storage
+
+    translate_to = ctx.get("translate_to")     # set when the source language needs translating
+    translated_text: str | None = None         # reused for metadata if captions translate
 
     # 1. Cut (re-encode for frame-accurate boundaries).
     cut_path = out_dir / f"seg_{i}_cut.mp4"
@@ -499,7 +507,19 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
         ]
         if words_in_segment:
             ass_path = out_dir / f"seg_{i}.ass"
-            write_ass(words_in_segment, ass_path, style=req.caption_style, resolution=target_dims)
+            if translate_to:
+                # Whisper produced the wrong language → translate caption lines to
+                # the target (line-level; per-word karaoke can't survive translation).
+                phrases = captions_mod.group_into_phrases(words_in_segment, max_words=4)
+                originals = [" ".join(w.text for w in ph.words) for ph in phrases]
+                translated = await translation.translate_lines(originals, translate_to)
+                translated_text = " ".join(t for t in translated if t.strip())
+                ass_path.write_text(
+                    captions_mod.render_ass_lines(phrases, translated,
+                                                  style=req.caption_style, resolution=target_dims),
+                    encoding="utf-8")
+            else:
+                write_ass(words_in_segment, ass_path, style=req.caption_style, resolution=target_dims)
             captioned = out_dir / f"seg_{i}_cap.mp4"
             await ff.burn_ass(current, ass_path, captioned)
             current = captioned
@@ -530,8 +550,14 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
     # Per-clip metadata so each clip streams to the UI fully formed (title +
     # caption + hashtags). Best-effort — a metadata hiccup never drops the clip.
     try:
+        # Feed metadata the TRANSLATED transcript when we have it, so titles/
+        # captions come out in the target language instead of echoing Kazakh.
+        meta_transcript = seg.transcript
+        if translate_to:
+            meta_transcript = translated_text or await translation.translate_text(
+                seg.transcript, translate_to)
         metas = await clip_metadata.generate_for_clips(
-            [clip_metadata.ClipInput(transcript=seg.transcript, reason=seg.reason)],
+            [clip_metadata.ClipInput(transcript=meta_transcript, reason=seg.reason)],
             language=ctx.get("source_language"))
         if metas:
             art.title, art.caption, art.hashtags = metas[0].title, metas[0].caption, metas[0].hashtags

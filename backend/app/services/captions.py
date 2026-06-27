@@ -203,6 +203,30 @@ def render_ass(
     )
 
 
+def render_ass_lines(
+    phrases: Sequence[Phrase],
+    texts: Sequence[str],
+    *,
+    style: CaptionStyle = "karaoke",
+    resolution: tuple[int, int] = (1080, 1920),
+) -> str:
+    """
+    Render PRE-TRANSLATED caption text line-by-line. Translation changes word
+    count/order so per-word karaoke timing can't be preserved — instead each
+    translated line shows as one popped-in row over its phrase's time span,
+    keeping captions in sync with speech while matching the target language.
+    """
+    preset = STYLE_PRESETS[style]
+    res_x, res_y = resolution
+    events: list[str] = []
+    for ph, text in zip(phrases, texts):
+        if not str(text).strip():
+            continue
+        body = r"{\fad(80,80)\fscx90\fscy90\t(0,120,\fscx100\fscy100)}" + _escape(str(text))
+        events.append(f"Dialogue: 0,{_ass_ts(ph.start)},{_ass_ts(ph.end)},{preset.name},,0,0,0,,{body}")
+    return ASS_HEADER.format(res_x=res_x, res_y=res_y, styles=preset.to_line()) + "\n".join(events)
+
+
 def _render_phrase(phrase: Phrase, style: CaptionStyle) -> str:
     """Apply per-style word-level animation overrides."""
     if style == "karaoke":
