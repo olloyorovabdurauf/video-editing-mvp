@@ -113,9 +113,9 @@ def _on_task_failure(sender=None, task_id=None, exception=None, **kw):
         from app.services import billing as _billing
         if state.get("credit_hold_id") and state.get("user_id") not in (None, "anonymous"):
             _billing.refund(state["user_id"], state["credit_hold_id"])
-        _update(job_id,
-                status=ReelJobStatus.FAILED.value,
-                message=f"{sender.name if sender else 'unknown'}: {exception}")
+        msg = (_AI_QUOTA_MSG if _is_quota_error(exception)
+               else f"{sender.name if sender else 'unknown'}: {exception}")
+        _update(job_id, status=ReelJobStatus.FAILED.value, message=msg)
         _purge_job_files(job_id)        # don't leak the download of a failed job
     except Exception as e:
         logger.warning("failure-handler couldn't refund/clean: {}", e)
@@ -124,6 +124,17 @@ def _on_task_failure(sender=None, task_id=None, exception=None, **kw):
 def _run(coro):
     """Bridge async helpers into sync Celery tasks (one loop per task call)."""
     return asyncio.run(coro)
+
+
+# Friendly message + detector for an exhausted OpenAI account (HTTP 429
+# insufficient_quota). Retrying won't help — it needs a billing top-up — so we
+# fail fast and show this instead of the raw provider JSON.
+_AI_QUOTA_MSG = "AI service is temporarily unavailable (provider quota reached). Please try again later."
+
+
+def _is_quota_error(exc: object) -> bool:
+    s = str(exc).lower()
+    return "insufficient_quota" in s or "exceeded your current quota" in s
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +232,10 @@ def t_transcribe(self, ctx: dict) -> dict:
         _update(ctx["job_id"], status=ReelJobStatus.FAILED.value, message=str(e))
         raise
     except Exception as e:
+        if _is_quota_error(e):           # OpenAI billing — don't waste retries
+            logger.error("OpenAI quota exhausted — top up the OpenAI account: {}", e)
+            _update(ctx["job_id"], status=ReelJobStatus.FAILED.value, message=_AI_QUOTA_MSG)
+            raise
         logger.exception("transcription failed")
         raise self.retry(exc=e, countdown=10)
 
