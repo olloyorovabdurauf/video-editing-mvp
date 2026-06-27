@@ -78,15 +78,45 @@ def _wav_duration_s(path: Path) -> float:
     return max(0.0, (path.stat().st_size - _WAV_HEADER) / _BYTES_PER_SEC)
 
 
+# ISO-639-1 codes OpenAI's transcription API accepts for the `language` param.
+# Uzbek ('uz') is deliberately ABSENT — OpenAI rejects it ("unsupported_language",
+# HTTP 400). Forcing only these; everything else auto-detects (+ optional bias).
+_WHISPER_LANGS = frozenset({
+    "af", "ar", "hy", "az", "be", "bs", "bg", "ca", "zh", "hr", "cs", "da", "nl",
+    "en", "et", "fi", "fr", "gl", "de", "el", "he", "hi", "hu", "is", "id", "it",
+    "ja", "kn", "kk", "ko", "lv", "lt", "mk", "ms", "mr", "mi", "ne", "no", "fa",
+    "pl", "pt", "ro", "ru", "sr", "sk", "sl", "es", "sw", "sv", "tl", "ta", "th",
+    "tr", "uk", "ur", "vi", "cy",
+})
+
+# For languages Whisper can't be FORCED into, bias it with a prompt in that
+# language/script so the transcript leans the right way (best-effort).
+_LANG_HINTS = {
+    "uz": "Bu audio o'zbek tilida. Iltimos, o'zbek tilida, lotin alifbosida yozing.",
+}
+
+
+def _whisper_extra(language: str | None) -> dict:
+    """Extra Whisper args: force a supported language, else bias an unsupported
+    one with a prompt, else nothing (auto-detect). Never sends an unsupported
+    `language` (which 400s)."""
+    if language in _WHISPER_LANGS:
+        return {"language": language}
+    if language and language in _LANG_HINTS:
+        return {"prompt": _LANG_HINTS[language]}
+    return {}
+
+
 async def _transcribe_file(client: AsyncOpenAI, path: Path, *, offset: float,
                            model: str, language: str | None = None) -> Transcript:
     """Transcribe one (≤limit) audio file; shift word timestamps by `offset`.
 
-    `language` (ISO-639-1, e.g. "uz") FORCES Whisper to transcribe in that
-    language — critical for low-resource languages like Uzbek that Whisper
-    otherwise mis-detects as Kazakh/Russian. None = auto-detect.
+    `language` (ISO-639-1) forces Whisper when OpenAI supports it; for codes it
+    rejects (e.g. Uzbek 'uz') we auto-detect and bias with a prompt instead. The
+    returned Transcript is still LABELLED with the requested language so the
+    captions/titles downstream lock to it.
     """
-    extra = {"language": language} if language else {}
+    extra = _whisper_extra(language)
     with path.open("rb") as f:
         resp = await client.audio.transcriptions.create(
             model=model, file=f,

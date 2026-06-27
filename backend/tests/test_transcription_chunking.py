@@ -125,3 +125,18 @@ def test_to_srt_from_offset_words():
     t = Transcript("en", "", [Word("late", 605.0, 605.4), Word("word", 605.5, 606.0)])
     srt = t.to_srt()
     assert "00:10:05" in srt   # 605s = 10m05s, proving offsets flow into captions
+
+
+# ---------------------------------------------------------------------------
+# Language gating — never send Whisper a code it rejects (uz → 400)
+# ---------------------------------------------------------------------------
+
+def test_whisper_extra_gates_unsupported_language():
+    assert tr._whisper_extra("kk") == {"language": "kk"}     # supported → forced
+    assert tr._whisper_extra("en") == {"language": "en"}
+    assert tr._whisper_extra("ru") == {"language": "ru"}
+    # Uzbek is NOT an OpenAI-supported language param → must NOT be forced (400),
+    # biased with a prompt instead.
+    uz = tr._whisper_extra("uz")
+    assert "language" not in uz and "prompt" in uz
+    assert tr._whisper_extra(None) == {}                     # auto-detect
