@@ -31,7 +31,7 @@ job state as each finishes. It is NOT synchronous.
 | Stage | Code | What it does |
 |-------|------|--------------|
 | Download | `tasks/video_tasks.py::t_download` → `services/ingestion.py` | yt-dlp (platform) or direct HTTP (media URL). Sweeps stale disk first. |
-| Transcribe | `t_transcribe` → `services/transcription.py` | OpenAI Whisper, chunked >20MB, parallel. **Forces language only if Whisper supports it** (`_WHISPER_LANGS`); Uzbek isn't supported → auto-detect + bias + flag `translate_to`. |
+| Transcribe | `t_transcribe` → `services/transcription.py` (+ `services/google_stt.py`) | OpenAI Whisper, chunked >20MB, parallel. **Forces language only if Whisper supports it** (`_WHISPER_LANGS`). Languages in `GOOGLE_STT_LANGUAGES` (Uzbek) route to **Google STT** (native `uz-UZ`) when creds are set; any failure falls back to Whisper+translate. `Transcript.is_source_language` decides whether downstream translates. |
 | Analyze | `t_analyze` → `services/segment_picker.py` | GPT picks COMPLETE 45–60s clips (hook→context→value→payoff), 4-factor scoring, sentence-boundary snapping, distribution fallback to guarantee N. |
 | Render | `t_render` → `_render_all`/`_render_segment` | Per clip, **in parallel** (semaphore): cut → smart-crop → b-roll → captions → music → upload → metadata. Streams each finished clip to job state. |
 | Caption | `services/captions.py` (+ `services/translation.py`) | Animated word-level ASS (libass). If `translate_to` set, translate lines to target language (line-level). |
@@ -72,14 +72,19 @@ state via `GET /reels/:id`.
 `OPENAI_API_KEY`, `DATABASE_URL` (Fly MPG, pgbouncer), `REDIS_URL` + `CELERY_*`
 (Upstash), `AUTH_MODE=clerk` + `CLERK_JWKS_URL`, `APP_ENV=production`,
 `CORS_ORIGINS`, `REQUIRE_CREDITS=true`. Optional: `FFMPEG_HWACCEL` (=`none`
-forces CPU), `FFMPEG_PRESET` (superfast), `RENDER_CONCURRENCY` (3), `YTDLP_PROXY`.
+forces CPU), `FFMPEG_PRESET` (superfast), `RENDER_CONCURRENCY` (3), `YTDLP_PROXY`,
+`GOOGLE_STT_CREDENTIALS` (service-account JSON → native Uzbek ASR),
+`GOOGLE_STT_LANGUAGES` (default `uz`), `GOOGLE_STT_MODEL` (default `latest_long`).
 
 ## Known decisions / gotchas
 
 - **`flyctl deploy` resets the VM size** (ignores `[[vm]]`) → re-run
   `flyctl scale vm performance-4x` after every deploy.
-- **Whisper can't do Uzbek** (transcribes as Kazakh) → translation layer; the
-  real fix is a Uzbek-capable ASR (e.g. Google STT `uz-UZ`).
+- **Whisper can't do Uzbek** (transcribes as Kazakh). Fixed with native Google
+  STT (`services/google_stt.py`, `uz-UZ`), routed for `GOOGLE_STT_LANGUAGES` when
+  `GOOGLE_STT_CREDENTIALS` is set; the Whisper+translate layer is now the
+  fallback. Enable: set the `GOOGLE_STT_CREDENTIALS` Fly secret (service-account
+  JSON) — no rebuild, the client ships in the image.
 - **No GPU on the current Fly host** → `CPUEncoder` (libx264). `GPUEncoder`
   (NVENC) auto-engages on a GPU machine, zero code change.
 - **Storage is a 40GB volume, not object storage** → 7-day retention sweep +
