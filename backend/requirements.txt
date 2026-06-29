@@ -12,6 +12,9 @@ flower==2.0.1                # Celery monitoring UI
 
 # --- AI / external ---
 openai==1.51.0               # Whisper + GPT-4o
+# Native Uzbek ASR. Whisper has no Uzbek model (transcribes it as Kazakh); Google
+# STT has uz-UZ. Routed only for langs in GOOGLE_STT_LANGUAGES when creds are set.
+google-cloud-speech==2.27.0
 httpx==0.27.2                # Pexels / Pixabay
 tenacity==9.0.0              # Retries with backoff
 

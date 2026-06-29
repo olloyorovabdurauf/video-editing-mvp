@@ -19,6 +19,11 @@ out/
 .env.production
 .env.*.local
 !.env.example
+# Google Cloud service-account keys (Uzbek STT). Never commit; we push the JSON
+# to Fly as the GOOGLE_STT_CREDENTIALS secret instead.
+*-stt.json
+gcp-*.json
+**/service-account*.json
 
 # --- Build artifacts / runtime state ---
 backend/storage/

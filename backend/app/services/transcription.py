@@ -30,6 +30,10 @@ class Transcript:
     language: str
     text: str
     words: list[Word]
+    # True when `text` is genuinely in `language`. False when we had to settle for
+    # a model that produces the WRONG language (Whisper forced toward Uzbek emits
+    # Kazakh) → downstream must translate. Native providers (Google STT) set True.
+    is_source_language: bool = True
 
     def to_srt(self) -> str:
         """Group words into ~1.2s caption rows. Good for animated burn-ins."""
@@ -130,11 +134,27 @@ async def _transcribe_file(client: AsyncOpenAI, path: Path, *, offset: float,
     ]
     # When forced, trust the requested language over Whisper's echo.
     lang = language or resp.language or "en"
-    return Transcript(language=lang, text=resp.text or "", words=words)
+    # If we asked for a language Whisper can't produce (e.g. uz), the text is in
+    # the WRONG language even though we label it `lang` → flag for translation.
+    native = language is None or language in _WHISPER_LANGS
+    return Transcript(language=lang, text=resp.text or "", words=words,
+                      is_source_language=native)
 
 
 async def transcribe(video_path: Path, *, language: str | None = None) -> Transcript:
     settings = get_settings()
+
+    # Languages Whisper can't do (Uzbek → transcribed as Kazakh) route to Google
+    # STT's native model when credentials are configured. On any failure we fall
+    # through to Whisper + the translation layer so a job never hard-fails here.
+    if language and language in settings.google_stt_language_set:
+        from app.services import google_stt
+        try:
+            return await google_stt.transcribe(video_path, language=language)
+        except Exception as e:                       # noqa: BLE001 — degrade, don't crash
+            logger.warning("Google STT failed for '{}' ({}); falling back to Whisper",
+                           language, e)
+
     # Generous per-request timeout: a 10-min chunk upload + transcription.
     client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=300.0)
 
@@ -197,4 +217,6 @@ async def transcribe(video_path: Path, *, language: str | None = None) -> Transc
     all_words = [w for r in results for w in r.words]
     texts = [r.text for r in results if r.text]
     detected = language or next((r.language for r in results if r.language), "en")
-    return Transcript(language=detected, text=" ".join(texts), words=all_words)
+    native = language is None or language in _WHISPER_LANGS
+    return Transcript(language=detected, text=" ".join(texts), words=all_words,
+                      is_source_language=native)

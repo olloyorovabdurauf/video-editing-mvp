@@ -249,9 +249,10 @@ def t_transcribe(self, ctx: dict) -> dict:
 
     audio_minutes = round((transcript.words[-1].end / 60.0) if transcript.words else 0.0, 2)
     # Lock the language for all downstream text (captions/titles) to the source.
-    # If the user asked for a language Whisper CAN'T produce (e.g. Uzbek, which it
-    # transcribes as Kazakh), flag that captions + titles must be TRANSLATED.
-    translate_to = lang if (lang and lang not in transcription._WHISPER_LANGS) else None
+    # Only translate when the transcript ISN'T already in the requested language —
+    # i.e. Whisper was forced toward Uzbek and emitted Kazakh. When Google STT
+    # produced native Uzbek (is_source_language=True), no translation is needed.
+    translate_to = lang if (lang and not transcript.is_source_language) else None
     return {**ctx, "transcript_path": str(tpath), "audio_minutes": audio_minutes,
             "source_language": transcript.language, "translate_to": translate_to}
 

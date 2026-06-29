@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     # 120 min ≈ $0.72 of Whisper at most. Raise once you have paying users.
     max_source_minutes: int = 120
 
+    # Google Cloud Speech-to-Text — native ASR for languages Whisper can't do.
+    # Whisper has no Uzbek model and transcribes Uzbek audio AS Kazakh; Google
+    # has a native uz-UZ model, so for the languages listed below we route there
+    # instead of Whisper-then-translate. Credentials = a service-account JSON,
+    # given either as the raw JSON string OR a path to the .json file. Empty =
+    # disabled (Whisper-only; Uzbek falls back to the translation layer).
+    google_stt_credentials: str = ""
+    google_stt_languages: str = "uz"          # comma-separated ISO-639-1 codes
+    google_stt_model: str = "latest_long"     # falls back to default if unavailable
+
     # YouTube blocks data downloads from datacenter IPs after repeated use.
     # Set this to a residential/rotating proxy (e.g. http://user:pass@host:port)
     # for reliable YouTube downloads at scale. Empty = direct (works for direct
@@ -124,6 +134,15 @@ class Settings(BaseSettings):
     @property
     def is_prod(self) -> bool:
         return self.app_env.lower() == "production"
+
+    @property
+    def google_stt_language_set(self) -> frozenset[str]:
+        """ISO codes routed to Google STT (only when credentials are present)."""
+        if not self.google_stt_credentials.strip():
+            return frozenset()
+        return frozenset(
+            c.strip().lower() for c in self.google_stt_languages.split(",") if c.strip()
+        )
 
 
 @lru_cache
