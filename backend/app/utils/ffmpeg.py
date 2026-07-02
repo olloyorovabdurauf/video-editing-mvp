@@ -518,6 +518,43 @@ async def concat_segments(srcs: Sequence[Path], dst: Path) -> Path:
         list_path.unlink(missing_ok=True)
 
 
+async def finalize_faststart(src: Path, dst: Path) -> Path:
+    """
+    Relocate the MP4 `moov` atom to the FRONT of the file (`-movflags +faststart`)
+    via a stream copy — no re-encode, so it's fast and lossless.
+
+    This is REQUIRED for progressive playback. The final reel is produced by
+    burn_ass / mix_music, and neither sets faststart, so the moov atom ends up at
+    the END of the file — the browser must then download the whole clip before it
+    can render the first frame. Running this last makes the first frame playable
+    on the first bytes received (and lets a CDN/range server stream it).
+    """
+    cmd = (
+        FFmpegCommand()
+        .add_input(src)
+        .add_output_args("-c", "copy", "-movflags", "+faststart")
+        .with_output(dst)
+    )
+    return await run(cmd)
+
+
+async def poster_frame(src: Path, dst: Path, *, at: float = 1.0, width: int = 720) -> Path:
+    """
+    Extract a single still (JPEG) at `at` seconds, scaled to `width` px wide.
+
+    Used as the <video> poster + list thumbnail so the UI can show an instant
+    image before any video bytes are fetched (lazy loading). `-ss` before `-i`
+    does a fast keyframe seek.
+    """
+    cmd = (
+        FFmpegCommand()
+        .add_input(src, "-ss", f"{max(0.0, at):.3f}")
+        .add_output_args("-frames:v", "1", "-vf", f"scale={width}:-2:flags=lanczos", "-q:v", "3")
+        .with_output(dst)
+    )
+    return await run(cmd)
+
+
 async def overlay_broll(
     base: Path,
     broll: Path,

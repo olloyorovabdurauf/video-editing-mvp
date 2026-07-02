@@ -107,6 +107,14 @@ class Segment(BaseModel):
     value_score: float = Field(0.0, ge=0, le=1)
     completeness_score: float = Field(0.0, ge=0, le=1)
     payoff_score: float = Field(0.0, ge=0, le=1)
+    # Extended viral rubric (hierarchical analysis). Optional + back-compatible:
+    # default 0 for clips picked before this rubric existed. Folded into `score`;
+    # standalone_score is applied as a hard gate in the picker, not a weight.
+    curiosity_score: float = Field(0.0, ge=0, le=1)
+    emotion_score: float = Field(0.0, ge=0, le=1)
+    retention_score: float = Field(0.0, ge=0, le=1)
+    standalone_score: float = Field(0.0, ge=0, le=1)
+    virality_score: float = Field(0.0, ge=0, le=1)
     score: float = Field(0.0, ge=0, le=1)          # overall, completeness-weighted
     reason: str = ""                               # why this works as a standalone clip
     summary: str = ""                              # one line: the complete idea it covers

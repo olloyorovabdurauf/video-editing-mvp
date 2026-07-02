@@ -26,48 +26,78 @@ from app.schemas.reel import Segment
 from app.services import ai_cache
 from app.services.transcription import Transcript, Word
 
-# Overall score weights. Completeness + value dominate so we stop rewarding lone
-# hooks. Tunable, must sum to 1.0.
-_W_HOOK, _W_VALUE, _W_COMPLETE, _W_PAYOFF = 0.20, 0.25, 0.35, 0.20
+# Overall score = a viral-editor blend of the full rubric. Structure
+# (completeness) dominates so we never reward a lone hook; retention + virality
+# capture shareability. standalone_score is applied as a hard GATE in _ask, not a
+# weight. Tunable; must sum to 1.0.
+_WEIGHTS = {
+    "hook_score":         0.13,
+    "curiosity_score":    0.09,
+    "emotion_score":      0.10,
+    "value_score":        0.14,
+    "retention_score":    0.12,
+    "completeness_score": 0.18,
+    "payoff_score":       0.14,   # the conclusion / resolution
+    "virality_score":     0.10,
+}
+
+
+def _overall(scores: dict) -> float:
+    """Weighted overall quality in [0,1] from the rubric dimensions."""
+    return round(sum(w * float(scores.get(k, 0.0)) for k, w in _WEIGHTS.items()), 3)
 
 SYSTEM_PROMPT = """\
-You are a professional short-form video editor turning a long video into
-COMPLETE standalone clips for Reels, Shorts and TikTok. You are NOT a highlight
-extractor: never return a lone hook, a clever sentence, or a contextless moment.
+You are a TOP 1% short-form video editor (think Opus Clip / a senior TikTok
+editor) turning a long video into COMPLETE, standalone clips for Reels, Shorts
+and TikTok. You are NOT a highlight extractor: never return a lone hook, a clever
+sentence, or a contextless moment.
 
-Find {n} DISTINCT complete clips spread across DIFFERENT parts of the video
-(beginning, middle, end) — not {n} variations of the same moment. Aim for exactly
-{n}. Each clip MUST:
-- Be between {min_dur} and {max_dur} seconds long. NEVER shorter than {min_dur}s.
-- Contain a COMPLETE idea the viewer fully understands WITHOUT the original video:
-    0-5s            a strong hook / clear opening
-    5-15s           context or the problem
-    15-{value_end}s the main value, story, or explanation
-    {value_end}-end a conclusion / payoff that resolves the opening
+WORK IN TWO STEPS.
+
+STEP 1 — UNDERSTAND THE WHOLE VIDEO. Read the entire transcript and build a
+semantic map: identify the major topics, stories, lessons, arguments, emotional
+moments and transitions. Split it into LOGICAL STORY BLOCKS by MEANING, never by
+time — each block is one complete unit of communication with a real beginning and
+end. Put that map in "story_map".
+
+STEP 2 — SELECT {n} CLIPS from those blocks, spread across DIFFERENT parts of the
+video (beginning, middle, end) — not {n} variations of the same moment. Each clip
+MUST:
+- Be between {min_dur} and {max_dur} seconds. NEVER shorter than {min_dur}s.
+- Follow a COMPLETE arc the viewer understands WITHOUT the original video:
+    0-5s            POWER HOOK — a line that opens a curiosity gap or a stake
+    5-15s           CONTEXT — what is going on, so the topic is instantly clear
+    15-{value_end}s BODY — the full value/story/explanation, no missing logic
+    {value_end}-end CONCLUSION — a clear lesson, insight, payoff or takeaway
 - Begin at the START of a thought (a sentence boundary), never mid-sentence.
-- End on a finished thought — never mid-sentence, never on "...and that's why".
+- End on a FINISHED thought — never mid-sentence, never on "...and that's why".
 
-Do NOT select on emotional words, controversy, or energy alone. You are doing
-STORY-BOUNDARY DETECTION: find where a complete thought BEGINS and ENDS. For
-every candidate run this checklist:
-  1. Opening clarity — do the first 3-5s make sense with NO prior context?
-  2. Context        — will the viewer understand what's being discussed?
-  3. Main idea      — is the FULL explanation/story inside the clip?
-  4. Resolution     — does the speaker actually finish the thought (not cut off)?
-  5. Standalone     — posted on its own, does it deliver a complete idea?
-THE TEST: "If a viewer watches ONLY this clip and nothing else, will they fully
-understand the idea?" If no, do not return it. Move the start earlier to capture
-the setup, or the end later to capture the payoff — never start mid-thought or
-end on "...and that's why".
+PREFER clips containing: a surprising fact, a strong opinion or controversy, an
+emotional beat, a transformation, a mistake and its lesson, a story, a curiosity
+gap, or concrete actionable advice. AVOID generic filler and throat-clearing.
 
-For EACH clip score 0..1:
-  hook_score          strength of the opening (criterion 1)
-  value_score         how much insight/value the body delivers (criterion 3)
-  completeness_score  the STANDALONE score (criteria 2+5): does it stand fully
-                      on its own with a clear beginning, middle and end? MOST IMPORTANT.
-  payoff_score        how resolved/finished the ending is (criterion 4)
-Only return clips with completeness_score >= 0.6. If the video has fewer than
-{n} genuinely complete clips, return FEWER — never pad with fragments.
+REJECT a clip if it: starts in the middle, ends abruptly, has a weak or missing
+conclusion, or lacks the context needed to make sense on its own. Fix it first —
+move the start earlier to capture the setup, the end later to capture the payoff —
+or discard it.
+
+THE STANDALONE TEST (apply to EVERY clip): "If someone watched ONLY this clip on
+TikTok, with no other context, would they fully understand it and feel it was
+complete?" If NO, do not return it.
+
+Score every clip 0..1:
+  hook_score          strength of the first 3-5s
+  curiosity_score     how strong the opening curiosity gap / open question is
+  emotion_score       emotional pull (surprise, inspiration, tension, humor)
+  value_score         how much real insight/value the body delivers
+  retention_score     will a viewer keep watching to the end (pacing, payoff tease)
+  completeness_score  full beginning -> middle -> end arc. MOST IMPORTANT.
+  payoff_score        how resolved/satisfying the ending (the conclusion) is
+  standalone_score    understandable with ZERO external context (the test above)
+  virality_score      shareability / likelihood to perform on short-form
+Only return clips with completeness_score >= 0.6 AND standalone_score >= 0.6. If
+the video has fewer than {n} genuinely complete clips, return FEWER — never pad
+with fragments.
 
 Return STRICT JSON. No prose, no markdown.
 """
@@ -78,16 +108,23 @@ User directive (may be empty): {prompt}
 Transcript (each line = "[start-end] text"):
 {lines}
 
-Pick complete {min_dur}-{max_dur}s clips. Return JSON. Do NOT echo the transcript
-text — only timestamps, scores, a one-line reason and a one-line summary (we
-reconstruct the verbatim text ourselves from the timestamps).
+First map the video into story blocks, then pick complete {min_dur}-{max_dur}s
+clips from them. Do NOT echo the transcript text — only timestamps, scores, a
+one-line reason and a one-line summary (we reconstruct the verbatim text from the
+timestamps).
 {{
+  "story_map": [
+    {{"start": <float>, "end": <float>, "theme": "<short topic>",
+      "type": "story|lesson|argument|emotional|tip|other"}}
+  ],
   "segments": [
     {{
       "start": <float, a sentence boundary>,
       "end": <float, a sentence boundary, {min_dur}-{max_dur}s after start>,
-      "hook_score": <0..1>, "value_score": <0..1>,
+      "hook_score": <0..1>, "curiosity_score": <0..1>, "emotion_score": <0..1>,
+      "value_score": <0..1>, "retention_score": <0..1>,
       "completeness_score": <0..1>, "payoff_score": <0..1>,
+      "standalone_score": <0..1>, "virality_score": <0..1>,
       "reason": "<why this works as a complete standalone clip>",
       "summary": "<the complete idea this clip explains, one line>"
     }}
@@ -96,16 +133,17 @@ reconstruct the verbatim text ourselves from the timestamps).
 """
 
 # Fill pass: we already have some clips but fewer than the user asked for. Find
-# MORE distinct complete clips from OTHER parts of the video, relaxing the
-# completeness bar slightly (still full {min_dur}-{max_dur}s, sentence-bounded).
+# MORE distinct complete clips from OTHER story blocks, relaxing the bar slightly
+# (still full {min_dur}-{max_dur}s, sentence-bounded, standalone).
 FILL_SYSTEM_PROMPT = """\
-You are a short-form video editor. Find up to {n} MORE distinct, self-contained
-{min_dur}-{max_dur}s clips from parts of the video not already obviously covered.
-Each must still be at least {min_dur}s, begin and end on sentence boundaries, and
-cover a WHOLE thought (hook → context → value → payoff) — never a fragment. These
-can be solid rather than perfect: score completeness honestly (0.45-0.8). The
-0-5s/5-15s/15-{value_end}s/{value_end}-end structure still applies. STRICT JSON,
-same shape as requested.
+You are a top short-form video editor. Find up to {n} MORE distinct, self-
+contained {min_dur}-{max_dur}s clips from story blocks not already obviously
+covered. Each must still be at least {min_dur}s, begin and end on sentence
+boundaries, cover a WHOLE thought (hook -> context -> body -> conclusion) and pass
+the standalone test — never a fragment. These can be solid rather than perfect:
+score completeness/standalone honestly (0.45-0.8). The
+0-5s/5-15s/15-{value_end}s/{value_end}-end structure still applies. Same JSON
+shape (story_map + segments with the full score set). STRICT JSON.
 """
 
 
@@ -143,8 +181,9 @@ async def pick_segments(
     total = transcript.words[-1].end - transcript.words[0].start
     min_eff = min(min_duration_s, int(total))
 
-    # v3: invalidates clips cached before the whole-video / word-boundary fix.
-    ck = ai_cache.key("segpick_v3", compressed, n, min_eff, max_duration_s, prompt or "")
+    # v4: invalidates clips cached before the hierarchical rubric (new score
+    # dimensions + standalone gate change which clips win).
+    ck = ai_cache.key("segpick_v4", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
@@ -157,7 +196,7 @@ async def pick_segments(
             model=model,
             response_format={"type": "json_object"},
             temperature=temperature,
-            max_tokens=2200,
+            max_tokens=2600,               # room for the story_map + richer scores
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": USER_TEMPLATE.format(
@@ -166,7 +205,11 @@ async def pick_segments(
             ],
         )
         picks = _clamp(_safe_segments(resp), transcript, min_eff, max_duration_s)
-        picks = [p for p in picks if p.completeness_score >= min_completeness]
+        # Two gates: a complete arc AND it stands alone with zero external context
+        # (Issue 4). Both track the pass's bar so the fill pass can relax together.
+        picks = [p for p in picks
+                 if p.completeness_score >= min_completeness
+                 and p.standalone_score >= min_completeness]
         picks.sort(key=lambda x: x.score, reverse=True)
         return picks
 
@@ -354,14 +397,20 @@ def _clamp(raw: list, transcript: Transcript, min_s: int, max_s: int) -> list[Se
         if win is None:
             continue
         ws, we = win
-        hook = _f(s.get("hook_score")); value = _f(s.get("value_score"))
-        comp = _f(s.get("completeness_score")); pay = _f(s.get("payoff_score"))
-        overall = round(_W_HOOK * hook + _W_VALUE * value
-                        + _W_COMPLETE * comp + _W_PAYOFF * pay, 3)
+        scores = {
+            "hook_score":         _f(s.get("hook_score")),
+            "curiosity_score":    _f(s.get("curiosity_score")),
+            "emotion_score":      _f(s.get("emotion_score")),
+            "value_score":        _f(s.get("value_score")),
+            "retention_score":    _f(s.get("retention_score")),
+            "completeness_score": _f(s.get("completeness_score")),
+            "payoff_score":       _f(s.get("payoff_score")),
+            "standalone_score":   _f(s.get("standalone_score")),
+            "virality_score":     _f(s.get("virality_score")),
+        }
         out.append(Segment(
             start=ws, end=we,
-            hook_score=hook, value_score=value, completeness_score=comp,
-            payoff_score=pay, score=overall,
+            **scores, score=_overall(scores),
             reason=str(s.get("reason", ""))[:300],
             summary=str(s.get("summary", ""))[:300],
             transcript=_text_in_window(transcript, ws, we),
@@ -386,10 +435,12 @@ def _synthesize_from_transcript(transcript: Transcript, min_s: int, max_s: int) 
     else:
         ws, we = win
     text = _text_in_window(transcript, ws, we)
+    scores = {"hook_score": 0.4, "curiosity_score": 0.4, "emotion_score": 0.4,
+              "value_score": 0.5, "retention_score": 0.45, "completeness_score": 0.6,
+              "payoff_score": 0.4, "standalone_score": 0.55, "virality_score": 0.4}
     return Segment(
         start=round(ws, 2), end=round(we, 2),
-        hook_score=0.4, value_score=0.5, completeness_score=0.6, payoff_score=0.4,
-        score=round(_W_HOOK * 0.4 + _W_VALUE * 0.5 + _W_COMPLETE * 0.6 + _W_PAYOFF * 0.4, 3),
+        **scores, score=_overall(scores),
         reason="Best available complete section (no strongly viral hook detected).",
         summary=(text[:120] + "…") if len(text) > 120 else text,
         transcript=text,
@@ -429,10 +480,12 @@ def _distribute_clips(transcript: Transcript, have: list[Segment], n: int,
         if overlaps:
             continue
         text = _text_in_window(transcript, ws, we)
+        scores = {"hook_score": 0.45, "curiosity_score": 0.4, "emotion_score": 0.4,
+                  "value_score": 0.5, "retention_score": 0.45, "completeness_score": 0.55,
+                  "payoff_score": 0.45, "standalone_score": 0.5, "virality_score": 0.4}
         kept.append(Segment(
             start=round(ws, 2), end=round(we, 2),
-            hook_score=0.45, value_score=0.5, completeness_score=0.55, payoff_score=0.45,
-            score=round(_W_HOOK * 0.45 + _W_VALUE * 0.5 + _W_COMPLETE * 0.55 + _W_PAYOFF * 0.45, 3),
+            **scores, score=_overall(scores),
             reason="A complete section from this part of the video.",
             summary=(text[:120] + "…") if len(text) > 120 else text,
             transcript=text,

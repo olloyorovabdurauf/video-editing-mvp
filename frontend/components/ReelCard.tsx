@@ -2,6 +2,7 @@
 
 import { type ReelArtifact } from "@/lib/api";
 import { CopyButton } from "@/components/CopyButton";
+import { LazyVideo } from "@/components/LazyVideo";
 
 function fmt(t: number) {
   const m = Math.floor(t / 60);
@@ -27,13 +28,7 @@ export function ReelCard({ reel, index }: { reel: ReelArtifact; index: number })
       {/* Preview */}
       <div className="relative overflow-hidden rounded-xl bg-black">
         <div className="aspect-[9/16]">
-          <video
-            src={reel.output_url}
-            controls
-            preload="metadata"
-            className="h-full w-full object-contain"
-            poster={reel.thumbnail_url || undefined}
-          />
+          <LazyVideo src={reel.output_url} poster={reel.thumbnail_url} />
         </div>
         {/* Viral score badge */}
         <div

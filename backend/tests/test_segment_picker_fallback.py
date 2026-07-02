@@ -97,9 +97,33 @@ def test_clamp_builds_complete_scored_clip():
     seg = out[0]
     assert MIN - 2 <= seg.duration <= MAX
     assert seg.completeness_score == 0.8 and seg.summary == "s"
-    expected = round(0.20 * 0.9 + 0.25 * 0.7 + 0.35 * 0.8 + 0.20 * 0.6, 3)
+    # Overall folds the full rubric; dims the LLM omitted default to 0.5 (via _f).
+    expected = sp._overall({
+        "hook_score": 0.9, "value_score": 0.7, "completeness_score": 0.8, "payoff_score": 0.6,
+        "curiosity_score": 0.5, "emotion_score": 0.5, "retention_score": 0.5, "virality_score": 0.5})
     assert seg.score == expected
     assert "w0x0" in seg.transcript                # text filled from our words
+
+
+def test_weights_sum_to_one():
+    assert abs(sum(sp._WEIGHTS.values()) - 1.0) < 1e-9
+
+
+def test_clamp_folds_extended_rubric_into_overall():
+    t = _talk()
+    raw = [{"start": 0, "end": 50,
+            "hook_score": 0.8, "curiosity_score": 0.9, "emotion_score": 0.7,
+            "value_score": 0.8, "retention_score": 0.9, "completeness_score": 0.85,
+            "payoff_score": 0.8, "standalone_score": 0.9, "virality_score": 0.95,
+            "reason": "r", "summary": "s"}]
+    out = sp._clamp(raw, t, MIN, MAX)
+    assert len(out) == 1
+    seg = out[0]
+    assert seg.virality_score == 0.95 and seg.standalone_score == 0.9 and seg.curiosity_score == 0.9
+    assert seg.score == sp._overall({
+        "hook_score": 0.8, "curiosity_score": 0.9, "emotion_score": 0.7, "value_score": 0.8,
+        "retention_score": 0.9, "completeness_score": 0.85, "payoff_score": 0.8, "virality_score": 0.95})
+    assert 0 < seg.score <= 1
 
 
 def test_clamp_drops_malformed_picks():
@@ -178,6 +202,33 @@ async def test_incomplete_clip_filtered_then_escalates():
     assert len(out) == 1 and out[0].completeness_score == 0.75
     models = [c.kwargs["model"] for c in create.call_args_list]
     assert models[0] == s.openai_analysis_model and models[1] == s.openai_escalation_model
+
+
+@pytest.mark.asyncio
+async def test_low_standalone_is_gated_then_escalates():
+    """Issue 4: a clip with a complete arc but that DOESN'T stand alone is dropped
+    by the standalone gate → the picker escalates to find a real standalone clip."""
+    t = _talk()
+    weak = _resp({"segments": [{**_seg(0, 50, comp=0.85), "standalone_score": 0.3}]})
+    strong = _resp({"segments": [{**_seg(0, 50, comp=0.85), "standalone_score": 0.85}]})
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        create = AsyncMock(side_effect=[weak, strong])
+        oai.return_value.chat.completions.create = create
+        out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert len(out) == 1 and out[0].standalone_score == 0.85
+    assert create.call_count == 2                  # escalated because the first was gated out
+
+
+@pytest.mark.asyncio
+async def test_story_map_in_response_is_ignored():
+    """The model emits a story_map before segments; we read only segments."""
+    t = _talk()
+    resp = _resp({"story_map": [{"start": 0, "end": 90, "theme": "x", "type": "lesson"}],
+                  "segments": [_seg(0, 50, comp=0.8)]})
+    with patch.object(sp, "AsyncOpenAI") as oai:
+        oai.return_value.chat.completions.create = AsyncMock(return_value=resp)
+        out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
+    assert len(out) == 1
 
 
 @pytest.mark.asyncio

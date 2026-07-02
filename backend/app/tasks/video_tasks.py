@@ -540,13 +540,36 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
             except Exception as e:
                 logger.warning("music mix failed for seg {}: {}", i, e)
 
-    # 6. Promote to final name + upload to durable storage.
+    # 6. Promote to final name + faststart + poster, then upload to durable storage.
     final = out_dir / f"reel_{i}.mp4"
     if current != final:
         current.rename(final)
+
+    # Progressive playback: relocate the moov atom to the front so the browser can
+    # start rendering on the FIRST bytes instead of waiting for the whole file.
+    # burn_ass/mix_music (the last transforms) don't set faststart themselves, so
+    # without this the served clip has moov-at-end and feels slow to load.
+    try:
+        fast = out_dir / f"reel_{i}_fast.mp4"
+        await ff.finalize_faststart(final, fast)
+        fast.replace(final)
+    except Exception as e:
+        logger.warning("faststart remux failed for seg {} (serving as-is): {}", i, e)
+
     output_url = get_storage().put(final, key=f"output/{ctx['job_id']}/{final.name}")
 
-    art = ReelArtifact(segment=seg, output_url=output_url, broll=broll_meta)
+    # Poster/thumbnail so the UI shows an instant image and only fetches the video
+    # on demand (lazy loading). Best-effort — a poster hiccup never drops the clip.
+    thumbnail_url: str | None = None
+    try:
+        poster = out_dir / f"reel_{i}.jpg"
+        await ff.poster_frame(final, poster, at=min(1.5, max(0.3, seg.duration * 0.1)))
+        thumbnail_url = get_storage().put(poster, key=f"output/{ctx['job_id']}/{poster.name}")
+    except Exception as e:
+        logger.warning("poster generation failed for seg {}: {}", i, e)
+
+    art = ReelArtifact(segment=seg, output_url=output_url,
+                       thumbnail_url=thumbnail_url, broll=broll_meta)
 
     # Per-clip metadata so each clip streams to the UI fully formed (title +
     # caption + hashtags). Best-effort — a metadata hiccup never drops the clip.
