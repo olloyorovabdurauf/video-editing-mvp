@@ -3,8 +3,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
+from app.api.media import router as media_router
 from app.api.v1.router import api_router
 from app.config import get_settings
 from app.core.logging import configure_logging
@@ -51,11 +51,9 @@ def create_app() -> FastAPI:
         max_age=600,
     )
     app.include_router(api_router, prefix="/api/v1")
-    app.mount(
-        "/storage",
-        StaticFiles(directory=settings.storage_local_dir),
-        name="storage",
-    )
+    # Range-aware /storage route (replaces StaticFiles, which ignores Range on
+    # the pinned starlette — video seeking + iOS Safari need 206 responses).
+    app.include_router(media_router)
     return app
 
 
