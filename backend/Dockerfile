@@ -26,6 +26,20 @@ WORKDIR /app
 
 
 # ---------------------------------------------------------------------------
+# PO-token service builder — bgutil's Node companion for yt-dlp. YouTube
+# bot-checks datacenter IPs ("Sign in to confirm you're not a bot"); this
+# service mints BotGuard proof-of-origin tokens so downloads pass without
+# cookies or a residential proxy.
+# Version MUST match the bgutil-ytdlp-pot-provider pin in requirements.txt.
+# ---------------------------------------------------------------------------
+FROM node:20-slim AS potbuilder
+ARG BGUTIL_VERSION=1.3.1
+ADD https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${BGUTIL_VERSION}.tar.gz /tmp/bgutil.tar.gz
+RUN mkdir -p /opt/bgutil && tar -xzf /tmp/bgutil.tar.gz -C /opt/bgutil --strip-components=1 \
+    && cd /opt/bgutil/server && npm ci && npx tsc && npm prune --omit=dev
+
+
+# ---------------------------------------------------------------------------
 # Builder — install Python deps in an isolated wheel cache.
 # ---------------------------------------------------------------------------
 FROM base AS builder
@@ -41,6 +55,11 @@ RUN pip wheel --wheel-dir=/wheels -r requirements.txt
 # Runtime — copy wheels, install, drop privileges.
 # ---------------------------------------------------------------------------
 FROM base AS runtime
+
+# Node runtime for the PO-token service: the node 20 binary from the build
+# image (both bookworm → ABI-compatible) + the built server with prod deps.
+COPY --from=potbuilder /usr/local/bin/node /usr/local/bin/node
+COPY --from=potbuilder --chown=app:app /opt/bgutil/server /opt/bgutil/server
 
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .

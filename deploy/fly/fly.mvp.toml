@@ -30,10 +30,11 @@ primary_region = "fra"          # close to the user (Central Asia → Frankfurt)
     timeout = "5s"
     path = "/api/v1/livez"
 
-# One process running both services. tini (Dockerfile ENTRYPOINT) reaps both.
-# Celery in the background, uvicorn in the foreground.
+# One process running all three services. tini (Dockerfile ENTRYPOINT) reaps them.
+# bgutil PO-token service (127.0.0.1:4416 — the yt-dlp plugin's default) answers
+# YouTube's datacenter-IP bot checks; celery in the background, uvicorn foreground.
 [processes]
-  app = "sh -c 'celery -A app.core.celery_app.celery_app worker -Q ffmpeg,ai,io -c 2 -l INFO & exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*'"
+  app = "sh -c 'node /opt/bgutil/server/build/main.js & celery -A app.core.celery_app.celery_app worker -Q ffmpeg,ai,io -c 2 -l INFO & exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*'"
 
 [mounts]
   source = "reelforge_data"

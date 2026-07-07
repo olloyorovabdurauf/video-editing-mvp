@@ -24,7 +24,13 @@ ffmpeg-python==0.2.0         # Optional: we mostly call ffmpeg directly
 # confirm you're not a bot" / "no formats" failures. KEEP THIS CURRENT — bump
 # at least monthly (Dependabot/Renovate recommended). 2024.09.27 was 9 months
 # stale and could not extract YouTube at all from a datacenter IP.
-yt-dlp==2026.6.9             # Download YouTube/arbitrary URLs
+yt-dlp==2026.7.4             # Download YouTube/arbitrary URLs
+# PO-token provider: answers YouTube's "confirm you're not a bot" challenge on
+# datacenter IPs (Fly) with a real BotGuard proof-of-origin token instead of
+# cookies/proxy. Needs its Node companion service (built in the Dockerfile,
+# launched next to celery/uvicorn on 127.0.0.1:4416 — the plugin's default).
+# KEEP IN LOCKSTEP with the BGUTIL_VERSION arg in the Dockerfile.
+bgutil-ytdlp-pot-provider==1.3.1
 python-slugify==8.0.4
 loguru==0.7.2
 

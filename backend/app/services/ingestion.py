@@ -185,6 +185,15 @@ def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
 def _to_user_error(e: Exception) -> IngestionError:
     """Map a raw yt-dlp/HTTP error to a clear, user-facing message."""
     msg = str(e).lower()
+    # BEFORE the age/sign-in branch: YouTube's bot challenge reads "Sign in to
+    # confirm you're not a bot" — it's an IP-reputation check, not age gating,
+    # and matching on "sign in" first mislabeled it for users.
+    if "not a bot" in msg:
+        return IngestionError(
+            "YouTube temporarily challenged our downloader on this video. "
+            "Try again in a minute — if it keeps happening, upload the file directly.",
+            retryable=True, cause=e,
+        )
     if "private" in msg or "unavailable" in msg or "removed" in msg or "does not exist" in msg:
         return IngestionError("This video is private, removed, or region-locked.", cause=e)
     if "sign in" in msg or "age" in msg or "login" in msg or "confirm your age" in msg:

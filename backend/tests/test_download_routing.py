@@ -52,6 +52,17 @@ def test_age_restricted_message():
     assert "sign-in" in err.user_message.lower() or "age" in err.user_message.lower()
 
 
+def test_bot_check_is_not_mislabeled_as_age_restriction():
+    # YouTube's datacenter-IP challenge contains BOTH "sign in" and "bot" —
+    # it must map to the bot-check message (retryable), not the age one.
+    err = ingestion._to_user_error(Exception(
+        "ERROR: [youtube] g97I8Fvdkmc: Sign in to confirm you're not a bot. "
+        "Use --cookies-from-browser or --cookies for the authentication."))
+    assert "age" not in err.user_message.lower()
+    assert "try again" in err.user_message.lower()
+    assert err.retryable is True
+
+
 def test_rate_limit_message_is_retryable():
     err = ingestion._to_user_error(Exception("HTTP Error 403: Forbidden"))
     assert err.retryable is True
