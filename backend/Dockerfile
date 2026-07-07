@@ -38,6 +38,11 @@ ADD https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${
 RUN mkdir -p /opt/bgutil && tar -xzf /tmp/bgutil.tar.gz -C /opt/bgutil --strip-components=1 \
     && cd /opt/bgutil/server && npm ci && npx tsc && npm prune --omit=dev
 
+# Deno: yt-dlp's EJS challenge solver only supports deno as its default JS
+# runtime — without it YouTube extraction can't solve player challenges and
+# datacenter IPs stay stuck on "confirm you're not a bot" even with PO tokens.
+FROM denoland/deno:bin-2.9.1 AS deno
+
 
 # ---------------------------------------------------------------------------
 # Builder — install Python deps in an isolated wheel cache.
@@ -58,8 +63,10 @@ FROM base AS runtime
 
 # Node runtime for the PO-token service: the node 20 binary from the build
 # image (both bookworm → ABI-compatible) + the built server with prod deps.
+# Deno for yt-dlp's EJS player-challenge solver (see potbuilder stage note).
 COPY --from=potbuilder /usr/local/bin/node /usr/local/bin/node
 COPY --from=potbuilder --chown=app:app /opt/bgutil/server /opt/bgutil/server
+COPY --from=deno /deno /usr/local/bin/deno
 
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .
