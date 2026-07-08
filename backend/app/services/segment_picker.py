@@ -276,10 +276,17 @@ its EXACT spoken words, plus PRE/POST — the words just BEFORE and AFTER the cl
 4. Is there a complete conclusion?
 5. Does the ending feel natural (not mid-explanation, not abrupt)?
 6. Does it stand alone without the original video?
-If any answer is NO but the missing setup or conclusion is visible in PRE/POST,
-FIX the clip by moving its boundaries to where the IDEA begins and ends
-(start_delta/end_delta seconds, -30..30; negative start_delta pulls PRE words
-in, positive end_delta pulls POST words in; 0 if fine).
+THE FINISH GATE (apply before anything else): "Has the speaker FINISHED the
+idea?" If the final words leave the thought hanging and the conclusion is
+visible in POST, EXTEND end_delta to include it — keep extending until the
+payoff sentence is inside the clip. A viewer must never feel "wait... what
+happened next?".
+Every clip must contain ALL FIVE: (1) hook, (2) context, (3) main idea,
+(4) evidence/example, (5) conclusion/payoff. Missing parts that exist in
+PRE/POST → pull them in with boundary moves; truly absent → reject.
+Fix boundaries with start_delta/end_delta seconds (-30..30; negative
+start_delta pulls PRE words in, positive end_delta pulls POST words in; 0 if
+fine).
 DURATION IS NOT A RULE: ~45-60s is preferred, but completeness always wins — a
 complete 42s idea is right, an idea needing 67s to finish is right. Never
 shorten a clip if that removes context or the conclusion; never stop before an
@@ -468,19 +475,22 @@ def _finalize_window(words: list[Word], start: float, end: float,
     start = max(cand) if cand else t0
 
     # Where the idea ends, per the selection/review stages — honored even below
-    # min_s (short-but-complete beats padded), bounded by the hard band.
-    target_end = min(t1, max(end, start + hard_min))
+    # min_s (short-but-complete beats padded). A request beyond the hard band is
+    # NOT an idea's end (it's the whole-video failure mode) — aim at the soft
+    # target instead of stretching to the cap.
+    ideal = end if (end - start) <= hard_max else start + max_s
+    target_end = min(t1, max(ideal, start + hard_min))
 
     def _pick_end(boundaries: list[float]) -> float | None:
         usable = [b for b in boundaries if hard_min <= (b - start) <= hard_max]
         if not usable:
             under = [b for b in boundaries if start < b <= start + hard_max]
             return max(under) if under else None
-        soft = [b for b in usable if eff_min <= (b - start) <= max_s]
-        # The sentence end nearest the idea's end — from the preferred band when
-        # it has one, else anywhere in the hard band (42s or 67s both fine).
-        pool = soft or usable
-        return min(pool, key=lambda b: abs(b - target_end))
+        # MEANING FIRST: the sentence end nearest to where the idea actually
+        # ends — even when that's past max_s. (A previous version preferred any
+        # end inside the soft band, which cut 67s ideas at ~58s "to stay under
+        # 60" — exactly the interrupted-speaker feel we must never ship.)
+        return min(usable, key=lambda b: abs(b - target_end))
 
     end = _pick_end(sent_ends) if sent_ends else None
     if end is None:

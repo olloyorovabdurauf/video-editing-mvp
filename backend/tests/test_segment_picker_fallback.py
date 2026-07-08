@@ -54,7 +54,9 @@ def test_finalize_window_snaps_and_enforces_duration():
     assert win is not None
     start, end = win
     dur = end - start
-    assert MIN - 2 <= dur <= MAX                 # forced into range despite asking for 8s
+    # Semantic contract: an 8s ask is a fragment; the floor is the HARD band
+    # (0.6*MIN), not the soft MIN — short-but-complete beats padded.
+    assert 0.6 * MIN - 2 <= dur <= 1.5 * MAX
     # both ends land on sentence boundaries (start of a sentence / end of a sentence)
     starts, ends = sp._boundaries(t.words)
     assert any(abs(start - s) < 0.01 for s in starts)
@@ -74,14 +76,17 @@ def test_finalize_window_word_fallback_when_no_punctuation():
     win = sp._finalize_window(_transcript(words).words, 30, 90, MIN, MAX)
     assert win is not None
     s, e = win
-    assert MIN - 2 <= e - s <= MAX
+    # No punctuation → the LLM's requested end (60s span) is the only meaning
+    # signal; result stays inside the hard band, aligned to word boundaries.
+    assert 0.6 * MIN - 2 <= e - s <= 1.5 * MAX
 
 
 def test_finalize_window_never_returns_whole_video():
     # The 895s bug: even asking for a huge window, the result is capped at max.
     words = [(f"w{i}", float(i), float(i) + 0.4) for i in range(900)]   # 900s, no '.'
     s, e = sp._finalize_window(_transcript(words).words, 0, 900, MIN, MAX)
-    assert e - s <= MAX + 0.1
+    # An impossible ask aims back at the soft target, never the whole video.
+    assert e - s <= MAX + 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +144,7 @@ def test_clamp_drops_malformed_picks():
 def test_synthesize_never_exceeds_max_without_punctuation():
     words = [(f"w{i}", float(i), float(i) + 0.4) for i in range(300)]   # 300s, no '.'
     seg = sp._synthesize_from_transcript(_transcript(words), MIN, MAX)
-    assert seg is not None and seg.duration <= MAX + 0.1   # not the whole 300s
+    assert seg is not None and seg.duration <= MAX + 1.0   # not the whole 300s
 
 
 # ---------------------------------------------------------------------------
@@ -413,3 +418,13 @@ def test_whole_video_guard_survives_semantic_bounds():
     win = _finalize_window(words, 0.0, 280.0, 45, 60)
     assert win is not None
     assert win[1] - win[0] <= 90.0 + 0.1     # 1.5x max, capped — not 300s
+
+
+def test_idea_end_past_max_beats_infield_sentence():
+    """Sentence ends at 58s AND 67s; the idea ends at 67 (max=60). The cut must
+    follow the MEANING (67s) — never retreat to 58s just to stay under 60."""
+    from app.services.segment_picker import _finalize_window
+    words = _mk_words({57, 66}, total=120)
+    win = _finalize_window(words, 0.0, 67.0, 45, 60)
+    assert win is not None
+    assert win[1] >= 66.0                    # took the idea's true ending

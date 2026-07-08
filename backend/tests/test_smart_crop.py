@@ -84,3 +84,32 @@ def test_vertical_anchor_keeps_headroom_and_caption_space():
     biased = int(sc._crop_origin_expr([0.0, 1.0], [960, 960], src_dim=1920, crop_dim=1080, anchor=0.40))
     assert biased > centered
     assert 0 <= biased <= 1920 - 1080
+
+
+# ---------------------------------------------------------------------------
+# Framing mode: fit+blur for two-shots / close-ups, tracked crop otherwise
+# ---------------------------------------------------------------------------
+
+def test_persistent_two_shot_uses_fit_framing():
+    # Speakers 900px apart in every frame (crop 608 wide) → column loses one
+    # of them → fit+blur keeps both plus gestures.
+    frames = [FrameFaces(t=i * 0.5, faces=[Face(200, 500, 150, 150), Face(1100, 500, 160, 160)])
+              for i in range(20)]
+    assert sc._framing_mode(frames, crop_w=608, src_h=1080) == "fit"
+
+
+def test_single_speaker_keeps_tracked_crop():
+    frames = [FrameFaces(t=i * 0.5, faces=[Face(900 + i, 500, 180, 200)]) for i in range(20)]
+    assert sc._framing_mode(frames, crop_w=608, src_h=1080) == "track"
+
+
+def test_extreme_closeup_uses_fit_framing():
+    # Face fills >45% of source height in most frames → face-only column → fit.
+    frames = [FrameFaces(t=i * 0.5, faces=[Face(960, 500, 400, 520)]) for i in range(20)]
+    assert sc._framing_mode(frames, crop_w=608, src_h=1080) == "fit"
+
+
+def test_fit_blur_filter_shape():
+    filt = sc._fit_blur_filter(1920, 1080, 1080, 1920)
+    assert "gblur" in filt and "overlay" in filt
+    assert "scale=1080:608" in filt          # full 16:9 frame at target width, even dims

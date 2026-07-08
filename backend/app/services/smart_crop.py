@@ -180,6 +180,46 @@ def _crop_origin_expr(times: list[float], centers: list[float], *,
     return expr
 
 
+def _framing_mode(frames: list[FrameFaces], *, crop_w: int, src_h: int) -> str:
+    """
+    'track' (full-height speaker-following crop) vs 'fit' (whole frame over a
+    blurred background). Fit when the vertical column would LOSE real content:
+    - a persistent TWO-SHOT — speakers too far apart to share the column, so
+      tracking one discards the other plus reactions and hand gestures;
+    - a CLOSE-UP so large the column is face-only (no shoulders/gestures) —
+      fit restores natural chest-up composition instead of a wall of face.
+    """
+    sampled = [f for f in frames if f.faces]
+    if not sampled:
+        return "track"
+    two_shot = big_face = 0
+    for f in sampled:
+        xs = sorted(face.cx for face in f.faces)
+        if len(xs) >= 2 and (xs[-1] - xs[0]) > crop_w * _BOTH_FIT:
+            two_shot += 1
+        if max(f.faces, key=lambda x: x.area).h > 0.45 * src_h:
+            big_face += 1
+    if two_shot / len(sampled) > 0.35 or big_face / len(sampled) > 0.6:
+        return "fit"
+    return "track"
+
+
+def _fit_blur_filter(src_w: int, src_h: int, target_w: int, target_h: int) -> str:
+    """Full source frame scaled to target width, floating on a blurred,
+    darkened zoom-fill of itself — the standard professional podcast-short
+    treatment when cropping would cut people or gestures. The frame sits
+    slightly above centre: headroom feel + caption space below."""
+    fg_h = int(round(target_w * src_h / src_w / 2)) * 2
+    y = int(round((target_h - fg_h) * 0.38 / 2)) * 2
+    return (
+        f"split=2[bg][fg];"
+        f"[bg]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},gblur=sigma=24,eq=brightness=-0.06[bgb];"
+        f"[fg]scale={target_w}:{fg_h}:flags=lanczos[fgs];"
+        f"[bgb][fgs]overlay=0:{y},setsar=1"
+    )
+
+
 async def smart_crop_to_vertical(
     src: Path,
     dst: Path,
@@ -205,25 +245,30 @@ async def smart_crop_to_vertical(
     crop_w, crop_h = min(crop_w, src_w), min(crop_h, src_h)
 
     frames = _sample_frames(src, sample_fps=sample_fps)
-    if not frames:
-        logger.info("smart_crop: no faces → center crop for {}", src.name)
-        x_expr = str(max(0, (src_w - crop_w) // 2))
-        y_expr = str(max(0, (src_h - crop_h) // 2))
-    else:
-        n_faces = max((len(f.faces) for f in frames), default=0)
-        logger.info("smart_crop: tracking {} (≤{} faces) over {}", n_faces, n_faces, src.name)
-        tx, cx = _target_series(frames, crop_dim=crop_w, axis="x")
-        x_expr = _crop_origin_expr(tx, cx, src_dim=src_w, crop_dim=crop_w, anchor=0.5)
-        if crop_h < src_h:                   # vertical room exists → bias up for headroom + captions
-            ty, cy = _target_series(frames, crop_dim=crop_h, axis="y")
-            y_expr = _crop_origin_expr(ty, cy, src_dim=src_h, crop_dim=crop_h, anchor=_Y_ANCHOR)
-        else:
-            y_expr = "0"                     # full-height crop (16:9 source) — nothing to pan
+    mode = _framing_mode(frames, crop_w=crop_w, src_h=src_h) if frames else "track"
 
-    filt = (
-        f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr},"
-        f"scale={target_w}:{target_h}:flags=lanczos,setsar=1"
-    )
+    if mode == "fit":
+        logger.info("smart_crop: fit+blur framing (two-shot/close-up) for {}", src.name)
+        filt = _fit_blur_filter(src_w, src_h, target_w, target_h)
+    else:
+        if not frames:
+            logger.info("smart_crop: no faces → center crop for {}", src.name)
+            x_expr = str(max(0, (src_w - crop_w) // 2))
+            y_expr = str(max(0, (src_h - crop_h) // 2))
+        else:
+            n_faces = max((len(f.faces) for f in frames), default=0)
+            logger.info("smart_crop: tracking {} (≤{} faces) over {}", n_faces, n_faces, src.name)
+            tx, cx = _target_series(frames, crop_dim=crop_w, axis="x")
+            x_expr = _crop_origin_expr(tx, cx, src_dim=src_w, crop_dim=crop_w, anchor=0.5)
+            if crop_h < src_h:               # vertical room exists → bias up for headroom + captions
+                ty, cy = _target_series(frames, crop_dim=crop_h, axis="y")
+                y_expr = _crop_origin_expr(ty, cy, src_dim=src_h, crop_dim=crop_h, anchor=_Y_ANCHOR)
+            else:
+                y_expr = "0"                 # full-height crop (16:9 source) — nothing to pan
+        filt = (
+            f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr},"
+            f"scale={target_w}:{target_h}:flags=lanczos,setsar=1"
+        )
     cmd = (
         FFmpegCommand()
         .add_input(src)
