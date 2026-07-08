@@ -372,3 +372,44 @@ def test_reviewer_rejects_and_nudges(monkeypatch):
     assert len(out) == 2
     assert out[0].start >= 4.0                # nudge applied (then boundary-aligned)
     assert out == sorted(out, key=lambda x: x.start)
+
+
+# ---------------------------------------------------------------------------
+# Semantic boundaries: meaning beats duration (soft 45-60s, hard 27-90s band)
+# ---------------------------------------------------------------------------
+
+def _mk_words(sentence_ends_at, total=120):
+    from app.services.transcription import Word
+    ends = set(sentence_ends_at)
+    return [Word(text=("stop." if i in ends else "w"), start=float(i), end=i + 0.95)
+            for i in range(total)]
+
+
+def test_short_but_complete_idea_is_not_padded():
+    """Idea genuinely ends at ~42s (min=45): keep 42s, don't stretch into filler."""
+    from app.services.segment_picker import _finalize_window
+    words = _mk_words({41, 80})
+    win = _finalize_window(words, 0.0, 42.0, 45, 60)
+    assert win is not None
+    assert win[1] <= 43.0                    # ended where the idea ends
+    assert win[1] - win[0] >= 27.0           # still above the hard fragment floor
+
+
+def test_long_idea_completes_past_max():
+    """Conclusion lands at ~67s (max=60): the thought finishes, within hard cap."""
+    from app.services.segment_picker import _finalize_window
+    words = _mk_words({66}, total=120)
+    win = _finalize_window(words, 0.0, 58.0, 45, 60)
+    assert win is not None
+    assert win[1] >= 66.0                    # took the sentence end past max_s
+    assert win[1] - win[0] <= 90.0           # bounded by the platform hard cap
+
+
+def test_whole_video_guard_survives_semantic_bounds():
+    """No punctuation at all: end is still hard-capped, never the whole video."""
+    from app.services.segment_picker import _finalize_window
+    from app.services.transcription import Word
+    words = [Word(text="w", start=float(i), end=i + 0.95) for i in range(300)]
+    win = _finalize_window(words, 0.0, 280.0, 45, 60)
+    assert win is not None
+    assert win[1] - win[0] <= 90.0 + 0.1     # 1.5x max, capped — not 300s

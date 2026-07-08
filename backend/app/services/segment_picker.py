@@ -6,10 +6,12 @@ We ask the model for SELF-CONTAINED clips (a full hook → context → value →
 payoff arc) sized for Reels/Shorts/TikTok, and then we mechanically enforce the
 rules the model can't be trusted to follow exactly:
 
-  1. Duration is forced into [min_duration_s, max_duration_s] (default 45-60s) —
-     never a 5-10s fragment.
-  2. Start/end are snapped to SENTENCE boundaries, and the window is extended to
-     reach the minimum length, so a clip never opens or closes mid-thought.
+  1. Duration is SEMANTIC: [min_duration_s, max_duration_s] (default 45-60s) is
+     a soft preference — the clip ends where the idea ends (42s complete beats
+     60s padded; 67s to finish a thought is allowed). A hard 0.6x-1.5x band
+     (capped at 90s) still rejects fragments and the whole-video bug.
+  2. Start/end are snapped to SENTENCE boundaries so a clip never opens or
+     closes mid-thought.
   3. Clips are ranked by an overall score that weights *story completeness* most,
      not the hook alone. Clips below a completeness threshold are dropped.
 """
@@ -63,7 +65,10 @@ end. Put that map in "story_map".
 STEP 2 — SELECT {n} CLIPS from those blocks, spread across DIFFERENT parts of the
 video (beginning, middle, end) — not {n} variations of the same moment. Each clip
 MUST:
-- Be between {min_dur} and {max_dur} seconds. NEVER shorter than {min_dur}s.
+- AIM for {min_dur}-{max_dur} seconds — but MEANING BEATS DURATION: end the
+  clip where the idea naturally finishes. A complete idea at 40s beats a
+  padded 45s one; an idea that needs ~70s to reach its conclusion may take
+  it. Never pad, never truncate a thought to hit the target.
 - Follow a COMPLETE arc the viewer understands WITHOUT the original video:
     0-5s            POWER HOOK — a line that opens a curiosity gap or a stake
     5-15s           CONTEXT — what is going on, so the topic is instantly clear
@@ -137,7 +142,7 @@ timestamps).
 # (still full {min_dur}-{max_dur}s, sentence-bounded, standalone).
 FILL_SYSTEM_PROMPT = """\
 You are a top short-form video editor. Find up to {n} MORE distinct, self-
-contained {min_dur}-{max_dur}s clips from story blocks not already obviously
+contained clips (~{min_dur}-{max_dur}s preferred, completeness first) from story blocks not already obviously
 covered. Each must still be at least {min_dur}s, begin and end on sentence
 boundaries, cover a WHOLE thought (hook -> context -> body -> conclusion) and pass
 the standalone test — never a fragment. These can be solid rather than perfect:
@@ -183,7 +188,7 @@ async def pick_segments(
 
     # v4: invalidates clips cached before the hierarchical rubric (new score
     # dimensions + standalone gate change which clips win).
-    ck = ai_cache.key("segpick_v5r", compressed, n, min_eff, max_duration_s, prompt or "")
+    ck = ai_cache.key("segpick_v6", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
@@ -262,19 +267,27 @@ async def pick_segments(
     return out
 
 
-_REVIEW_PROMPT = """\
-You are a ruthless short-form QUALITY REVIEWER. For each numbered clip you get
-its EXACT spoken words. Judge each one: if a stranger watches ONLY this clip on
-Instagram, do they get (a) what's happening, (b) why it matters, (c) the full
-explanation, (d) a finished conclusion? Each clip also shows PRE/POST — the
-words just BEFORE and AFTER the clip (NOT included in it). If the missing setup
-or conclusion is sitting there, FIX the clip by moving boundaries
-(start_delta/end_delta seconds, -15..15, negative start_delta pulls PRE words
-in, positive end_delta pulls POST words in, 0 if fine) instead of rejecting.
+_REVIEW_PROMPT = """You are a ruthless short-form QUALITY REVIEWER. For each numbered clip you get
+its EXACT spoken words, plus PRE/POST — the words just BEFORE and AFTER the clip
+(NOT included in it). Validate every clip with these six questions:
+1. Does the viewer immediately understand the topic?
+2. Is enough context provided?
+3. Is the main idea fully explained?
+4. Is there a complete conclusion?
+5. Does the ending feel natural (not mid-explanation, not abrupt)?
+6. Does it stand alone without the original video?
+If any answer is NO but the missing setup or conclusion is visible in PRE/POST,
+FIX the clip by moving its boundaries to where the IDEA begins and ends
+(start_delta/end_delta seconds, -30..30; negative start_delta pulls PRE words
+in, positive end_delta pulls POST words in; 0 if fine).
+DURATION IS NOT A RULE: ~45-60s is preferred, but completeness always wins — a
+complete 42s idea is right, an idea needing 67s to finish is right. Never
+shorten a clip if that removes context or the conclusion; never stop before an
+explanation, argument or example is finished.
 Return STRICT JSON: {"reviews": [{"i": <n>, "verdict": "approve"|"reject",
 "start_delta": <s>, "end_delta": <s>, "reason": "<short>"}]}.
-Reject ONLY when unfixable even with boundary moves. Approve good clips —
-don't nitpick."""
+Reject ONLY when some answer stays NO even after boundary moves. Approve good
+clips — don't nitpick."""
 
 
 async def _review_clips(client, transcript: Transcript, segs: list[Segment],
@@ -312,8 +325,8 @@ async def _review_clips(client, transcript: Transcript, segs: list[Segment],
                 logger.info("reviewer rejected clip {} ({}s-{}s): {}",
                             i, round(s.start), round(s.end), r.get("reason", ""))
                 continue
-            ds = max(-15.0, min(15.0, float(r.get("start_delta") or 0)))
-            de = max(-15.0, min(15.0, float(r.get("end_delta") or 0)))
+            ds = max(-30.0, min(30.0, float(r.get("start_delta") or 0)))
+            de = max(-30.0, min(30.0, float(r.get("end_delta") or 0)))
             if ds or de:                         # nudge, then re-align to clean cuts
                 win = _finalize_window(transcript.words, s.start + ds, s.end + de, min_s, max_s)
                 if win:
@@ -409,21 +422,35 @@ def _boundaries(words: list[Word]) -> tuple[list[float], list[float]]:
     return starts, ends
 
 
+# Semantic-boundary bands. [min_s, max_s] is a SOFT preference (the product's
+# 45-60s target); completeness outranks it. The HARD band is the sanity/platform
+# envelope: fragments below it are rejected, and nothing may exceed it (Reels/
+# Shorts cap out around 90s — and it's the whole-video-bug guard).
+_HARD_MIN_FRACTION = 0.6      # e.g. min 45 → never below 27s
+_HARD_MAX_FRACTION = 1.5      # e.g. max 60 → never above 90s
+_PLATFORM_CAP_S = 90.0
+
+
 def _finalize_window(words: list[Word], start: float, end: float,
                      min_s: float, max_s: float) -> tuple[float, float] | None:
     """
-    Force [start, end] into a [min_s, max_s] window aligned to clean cut points.
+    Align [start, end] to where the IDEA begins and naturally finishes.
 
-    Prefers SENTENCE boundaries; falls back to WORD boundaries when Whisper's
-    word timestamps carry no punctuation (very common), and finally to a pure
-    time cut. Critically it NEVER returns the whole video — the end is hard-capped
-    at start+max_s. Returns None only for an essentially-empty transcript.
+    The requested `end` is treated as where the thought ends — the cut lands on
+    the sentence end nearest to it. [min_s, max_s] is only a soft preference:
+    a 42s complete idea is not stretched, a 67s one is not truncated. The hard
+    band (fractions above, capped at _PLATFORM_CAP_S) bounds the result so we
+    never emit fragments or the whole video. Prefers SENTENCE boundaries, falls
+    back to WORD boundaries (Whisper often omits punctuation), then a time cut.
+    Returns None only for an essentially-empty transcript or an unusable window.
     """
     if len(words) < 2:
         return None
     t0, t1 = words[0].start, words[-1].end
     total = t1 - t0
     eff_min = min(min_s, total)                  # source shorter than the floor → whole thing
+    hard_min = min(max(15.0, _HARD_MIN_FRACTION * min_s), total, eff_min)
+    hard_max = min(_PLATFORM_CAP_S, _HARD_MAX_FRACTION * max_s)
 
     start = max(t0, min(start, t1))
     sent_starts, sent_ends = _boundaries(words)
@@ -440,34 +467,32 @@ def _finalize_window(words: list[Word], start: float, end: float,
     cand = sent_cand or word_cand
     start = max(cand) if cand else t0
 
-    target_end = min(t1, max(end, start + eff_min))
+    # Where the idea ends, per the selection/review stages — honored even below
+    # min_s (short-but-complete beats padded), bounded by the hard band.
+    target_end = min(t1, max(end, start + hard_min))
 
-    # Completion grace: a clip may run a few seconds past max_s IF that lets the
-    # speaker FINISH the sentence — truncating the payoff mid-thought is a far
-    # worse edit than a slightly longer reel. (Grace applies to sentence ends
-    # only; the hard cap below still bounds everything.)
-    grace = min(6.0, 0.1 * max_s)
+    def _pick_end(boundaries: list[float]) -> float | None:
+        usable = [b for b in boundaries if hard_min <= (b - start) <= hard_max]
+        if not usable:
+            under = [b for b in boundaries if start < b <= start + hard_max]
+            return max(under) if under else None
+        soft = [b for b in usable if eff_min <= (b - start) <= max_s]
+        # The sentence end nearest the idea's end — from the preferred band when
+        # it has one, else anywhere in the hard band (42s or 67s both fine).
+        pool = soft or usable
+        return min(pool, key=lambda b: abs(b - target_end))
 
-    def _pick_end(boundaries: list[float], slack: float = 0.0) -> float | None:
-        in_range = [b for b in boundaries if eff_min <= (b - start) <= max_s + slack]
-        if in_range:
-            return min(in_range, key=lambda b: abs(b - target_end))
-        under = [b for b in boundaries if start < b <= start + max_s]
-        return max(under) if under else None
-
-    # END: prefer sentence ends (with grace to complete the thought), then
-    # word ends, then a hard time cut.
-    end = _pick_end(sent_ends, slack=grace) if sent_ends else None
+    end = _pick_end(sent_ends) if sent_ends else None
     if end is None:
         end = _pick_end(word_ends)
     if end is None:
         end = min(start + max_s, t1)
 
-    end = min(end, t1, start + max_s + grace)    # HARD CAP — never the whole video
-    if end - start < eff_min - 2.0:              # snapped too short → extend by time
+    end = min(end, t1, start + hard_max)         # HARD CAP — never the whole video
+    if end - start < hard_min - 2.0:             # unusable fragment
         end = min(t1, start + max_s)
 
-    if end - start < min(eff_min, total) - 2.0:
+    if end - start < min(hard_min, total) - 2.0:
         return None
     return (round(start, 2), round(end, 2))
 
