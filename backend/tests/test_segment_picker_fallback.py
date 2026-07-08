@@ -367,5 +367,8 @@ def test_reviewer_rejects_and_nudges(monkeypatch):
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
 
     out = asyncio.run(sp._review_clips(client, tr, segs, 45, 60))
-    assert len(out) == 1                      # the rejected clip is gone
+    # Rejected clip is replaced from an uncovered story region ("choose another
+    # story"), so the user still gets the requested count — but not that window.
+    assert len(out) == 2
     assert out[0].start >= 4.0                # nudge applied (then boundary-aligned)
+    assert out == sorted(out, key=lambda x: x.start)
