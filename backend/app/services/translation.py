@@ -67,15 +67,28 @@ async def translate_lines(lines: list[str], target_lang: str) -> list[str]:
         f"language.{extra} Return STRICT JSON {{\"lines\": [...]}} with EXACTLY the "
         f"same number of lines, in the same order."
     )
-    try:
-        content = await _call_llm(
-            [{"role": "system", "content": system},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            model=get_settings().openai_escalation_model, max_tokens=2000)
-        out = json.loads(content).get("lines", [])
-    except Exception as e:
-        logger.warning("translate_lines failed ({}) — keeping originals", e)
-        return lines
+    out: list = []
+    for attempt in (1, 2):                         # one retry if output validation fails
+        try:
+            content = await _call_llm(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                model=get_settings().openai_escalation_model, max_tokens=2000)
+            out = json.loads(content).get("lines", [])
+        except Exception as e:
+            logger.warning("translate_lines failed ({}) — keeping originals", e)
+            return lines
+        # Output validation: the translated lines must actually BE the target
+        # language's script (e.g. Latin Uzbek). Catching Cyrillic/Arabic here is
+        # what stops Kazakh captions from being burned into an Uzbek reel.
+        from app.services.clip_metadata import _wrong_language
+        joined = " ".join(str(x) for x in out)
+        if len(out) == len(idx) and not _wrong_language(joined, target_lang):
+            break
+        if attempt == 1:
+            logger.warning("translate_lines output failed validation for '{}' — regenerating",
+                           target_lang)
+            system += " PREVIOUS ATTEMPT WAS REJECTED for wrong language/script — comply exactly."
     if len(out) != len(idx):                       # count drift → unsafe to map, keep originals
         logger.warning("translate_lines count mismatch ({} vs {}) — keeping originals",
                        len(out), len(idx))

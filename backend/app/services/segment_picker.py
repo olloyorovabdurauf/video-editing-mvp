@@ -355,21 +355,28 @@ def _finalize_window(words: list[Word], start: float, end: float,
 
     target_end = min(t1, max(end, start + eff_min))
 
-    def _pick_end(boundaries: list[float]) -> float | None:
-        in_range = [b for b in boundaries if eff_min <= (b - start) <= max_s]
+    # Completion grace: a clip may run a few seconds past max_s IF that lets the
+    # speaker FINISH the sentence — truncating the payoff mid-thought is a far
+    # worse edit than a slightly longer reel. (Grace applies to sentence ends
+    # only; the hard cap below still bounds everything.)
+    grace = min(6.0, 0.1 * max_s)
+
+    def _pick_end(boundaries: list[float], slack: float = 0.0) -> float | None:
+        in_range = [b for b in boundaries if eff_min <= (b - start) <= max_s + slack]
         if in_range:
             return min(in_range, key=lambda b: abs(b - target_end))
         under = [b for b in boundaries if start < b <= start + max_s]
         return max(under) if under else None
 
-    # END: prefer sentence ends, then word ends, then a hard time cut.
-    end = _pick_end(sent_ends) if sent_ends else None
+    # END: prefer sentence ends (with grace to complete the thought), then
+    # word ends, then a hard time cut.
+    end = _pick_end(sent_ends, slack=grace) if sent_ends else None
     if end is None:
         end = _pick_end(word_ends)
     if end is None:
         end = min(start + max_s, t1)
 
-    end = min(end, t1, start + max_s)            # HARD CAP — never the whole video
+    end = min(end, t1, start + max_s + grace)    # HARD CAP — never the whole video
     if end - start < eff_min - 2.0:              # snapped too short → extend by time
         end = min(t1, start + max_s)
 

@@ -41,3 +41,21 @@ def test_render_ass_lines_uses_translated_text():
     assert "Salom dunyo" in out
     assert "Dialogue:" in out
     assert "hello" not in out                            # original (wrong-lang) text replaced
+
+
+def test_translate_lines_rejects_wrong_script_then_retries(monkeypatch):
+    """Kazakh (Cyrillic) output for an uz target must be rejected and retried."""
+    import asyncio, json as _json
+    from app.services import translation
+
+    calls = []
+    async def fake_llm(messages, *, model, max_tokens):
+        calls.append(messages)
+        if len(calls) == 1:                      # 1st attempt: Cyrillic → invalid for uz
+            return _json.dumps({"lines": ["Бизнесте табысқа жету"]})
+        return _json.dumps({"lines": ["Biznesda muvaffaqiyatga erishish"]})
+
+    monkeypatch.setattr(translation, "_call_llm", fake_llm)
+    out = asyncio.run(translation.translate_lines(["hello"], "uz"))
+    assert out == ["Biznesda muvaffaqiyatga erishish"]
+    assert len(calls) == 2                        # retried exactly once

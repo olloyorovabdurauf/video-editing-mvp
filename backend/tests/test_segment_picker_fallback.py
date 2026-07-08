@@ -328,3 +328,16 @@ async def test_truncated_json_does_not_crash():
         out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
     assert len(out) >= 1                               # never zero, never crashes
     assert MIN - 2 <= out[0].duration <= MAX
+
+
+def test_finalize_window_grace_completes_the_sentence():
+    """A sentence ending a few seconds past max_s is kept — never truncate the payoff."""
+    from app.services.segment_picker import _finalize_window
+    from app.services.transcription import Word
+    # Sentence ends at 64.0s; max_s=60. Grace (min(6, 10%)=6) must include it.
+    words = ([Word(text="w", start=float(i), end=float(i) + 0.9) for i in range(63)]
+             + [Word(text="end.", start=63.0, end=64.0)])
+    win = _finalize_window(words, 0.0, 58.0, 45, 60)
+    assert win is not None
+    assert win[1] >= 64.0                        # completed the thought
+    assert win[1] <= 66.1                        # but still bounded by max_s + grace

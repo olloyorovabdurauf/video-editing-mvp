@@ -268,8 +268,22 @@ def t_transcribe(self, ctx: dict) -> dict:
     # i.e. Whisper was forced toward Uzbek and emitted Kazakh. When Google STT
     # produced native Uzbek (is_source_language=True), no translation is needed.
     translate_to = lang if (lang and not transcript.is_source_language) else None
+    source_language = transcript.language
+    if not lang:
+        # Auto-detect mode: verify the ASR's label against the TEXT. Whisper
+        # mislabels Uzbek as Kazakh; without this check the wrong language
+        # flowed straight into captions/titles whenever the user left the
+        # selector on Auto. The guard's verdict wins on disagreement.
+        from app.services import language_guard
+        detected = _run(language_guard.detect_text_language(transcript.text))
+        if detected and detected != transcript.language:
+            logger.warning("language guard: ASR labeled '{}' but text is '{}' — "
+                           "translating captions/metadata to '{}'",
+                           transcript.language, detected, detected)
+            source_language = detected
+            translate_to = detected
     return {**ctx, "transcript_path": str(tpath), "audio_minutes": audio_minutes,
-            "source_language": transcript.language, "translate_to": translate_to}
+            "source_language": source_language, "translate_to": translate_to}
 
 
 @shared_task(name="pipeline.analyze", queue="ai", bind=True, max_retries=2)

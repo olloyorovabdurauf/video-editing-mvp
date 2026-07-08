@@ -29,7 +29,9 @@ from app.utils.ffmpeg import FFmpegCommand, run
 _SAMPLE_FPS = 1.5        # face samples per second
 _MAX_KEYFRAMES = 20      # crop-expression keyframe cap (ffmpeg-safe)
 _EMA_ALPHA = 0.4         # camera smoothing (lower = smoother/slower)
-_BOTH_FIT = 0.82         # two faces fit one frame if their span ≤ this × crop width
+_BOTH_FIT = 0.72         # two faces fit one frame if their span ≤ this × crop width
+                         # (0.72 → each outer face keeps ≥14% side margin; wider
+                         # spans follow the dominant speaker instead of edge-cropping)
 _Y_ANCHOR = 0.40         # subject sits at 40% down → headroom above, captions below
 
 
