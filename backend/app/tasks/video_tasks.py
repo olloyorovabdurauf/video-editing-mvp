@@ -465,9 +465,17 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
     #    failure only skips this clip, the others keep rendering.
     if ctx.get("audio_only"):
         raw_dir = settings.storage_local_dir / "raw" / ctx["job_id"]
-        cut_path = await asyncio.to_thread(
-            ingestion.download_section, ctx["source_url"], raw_dir, i,
-            seg.start, seg.end, session=i)
+        try:
+            cut_path = await asyncio.to_thread(
+                ingestion.download_section, ctx["source_url"], raw_dir, i,
+                seg.start, seg.end, session=i)
+        except Exception as e:
+            # One transient section failure shouldn't cost the user a clip —
+            # retry once on a DIFFERENT residential line (offset session).
+            logger.warning("section {} download failed ({}); retrying on another line", i, e)
+            cut_path = await asyncio.to_thread(
+                ingestion.download_section, ctx["source_url"], raw_dir, i,
+                seg.start, seg.end, session=i + 5)
     else:
         cut_path = out_dir / f"seg_{i}_cut.mp4"
         await ff.cut(source, cut_path, start=seg.start, end=seg.end, reencode=True)

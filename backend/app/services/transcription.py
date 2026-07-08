@@ -67,10 +67,9 @@ def _srt_ts(t: float) -> str:
 _SAMPLE_RATE = 16_000
 _BYTES_PER_SEC = _SAMPLE_RATE * 2            # mono, 16-bit
 _WAV_HEADER = 44
-_CHUNK_SECONDS = 600                          # 10 min ≈ 19.2MB per chunk (< 25MB)
+_CHUNK_SECONDS = 300                          # 5 min ≈ 9.6MB per chunk (< 25MB)
 _DIRECT_LIMIT_BYTES = 20 * 1024 * 1024        # send whole file if under this
-_CHUNK_CONCURRENCY = 4                         # parallel Whisper calls (rate-limit safe)
-_CHUNK_CONCURRENCY = 4                         # parallel Whisper calls (rate-limit safe)
+_CHUNK_CONCURRENCY = 8                         # parallel Whisper calls (rate-limit safe)
 
 
 class VideoTooLong(ValueError):
