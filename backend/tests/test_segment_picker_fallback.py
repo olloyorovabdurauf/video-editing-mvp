@@ -216,7 +216,7 @@ async def test_low_standalone_is_gated_then_escalates():
         oai.return_value.chat.completions.create = create
         out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
     assert len(out) == 1 and out[0].standalone_score == 0.85
-    assert create.call_count == 2                  # escalated because the first was gated out
+    assert create.call_count == 3                  # escalated (+1 reviewer pass)
 
 
 @pytest.mark.asyncio
@@ -278,7 +278,7 @@ async def test_accumulates_distinct_clips_toward_n():
         create = AsyncMock(side_effect=[cheap, esc, fill])
         oai.return_value.chat.completions.create = create
         out = await sp.pick_segments(t, n=5, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
-    assert create.call_count == 3                 # escalated + filled because still < n
+    assert create.call_count == 4                 # escalated + filled (+1 reviewer pass)
     assert len(out) == 3                          # 3 distinct clips gathered
     starts = [s.start for s in out]
     assert starts == sorted(starts)               # returned chronologically
@@ -313,7 +313,7 @@ async def test_stops_escalating_once_n_met():
         create = AsyncMock(side_effect=[cheap])
         oai.return_value.chat.completions.create = create
         out = await sp.pick_segments(t, n=3, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
-    assert create.call_count == 1                 # got 3 of 3 on the cheap pass → no escalation
+    assert create.call_count == 2                 # cheap pass + reviewer only — no escalation
     assert len(out) == 3
 
 
@@ -341,3 +341,31 @@ def test_finalize_window_grace_completes_the_sentence():
     assert win is not None
     assert win[1] >= 64.0                        # completed the thought
     assert win[1] <= 66.1                        # but still bounded by max_s + grace
+
+
+def test_reviewer_rejects_and_nudges(monkeypatch):
+    """Agent 4: rejected clips never render; nudged boundaries are re-finalized."""
+    import asyncio, json as _json
+    from types import SimpleNamespace
+    from app.services import segment_picker as sp
+    from app.services.transcription import Transcript, Word
+    from app.schemas.reel import Segment
+
+    words = [Word(text=("end." if i % 20 == 4 else "w"), start=float(i), end=i + 0.9)
+             for i in range(200)]   # sentences end at 4.9, 24.9, ... → starts at 5, 25, ...
+    tr = Transcript(language="en", text="x", words=words)
+    segs = [Segment(start=0.0, end=50.0, transcript="", score=0.9),
+            Segment(start=100.0, end=150.0, transcript="", score=0.5)]
+
+    verdicts = {"reviews": [
+        {"i": 0, "verdict": "approve", "start_delta": 5, "end_delta": 0, "reason": "tighten"},
+        {"i": 1, "verdict": "reject", "start_delta": 0, "end_delta": 0, "reason": "no conclusion"},
+    ]}
+    async def fake_create(**kw):
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=_json.dumps(verdicts)))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+
+    out = asyncio.run(sp._review_clips(client, tr, segs, 45, 60))
+    assert len(out) == 1                      # the rejected clip is gone
+    assert out[0].start >= 4.0                # nudge applied (then boundary-aligned)

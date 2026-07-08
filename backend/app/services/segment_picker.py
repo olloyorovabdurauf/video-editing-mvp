@@ -183,7 +183,7 @@ async def pick_segments(
 
     # v4: invalidates clips cached before the hierarchical rubric (new score
     # dimensions + standalone gate change which clips win).
-    ck = ai_cache.key("segpick_v4", compressed, n, min_eff, max_duration_s, prompt or "")
+    ck = ai_cache.key("segpick_v5", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
@@ -249,9 +249,71 @@ async def pick_segments(
         synth = _synthesize_from_transcript(transcript, min_eff, max_duration_s)
         out = [synth] if synth else []
 
+    # AGENT 4 — Quality Reviewer: re-read each FINALIZED clip's exact words
+    # (not the compressed buckets it was picked from) and veto/nudge before
+    # anything renders. This is the "would a cold viewer understand?" gate.
+    try:
+        out = await _review_clips(client, transcript, out, min_eff, max_duration_s)
+    except Exception as e:
+        logger.warning("quality reviewer failed (keeping picks): {}", e)
+
     if out:
         ai_cache.set_json(ck, [s.model_dump() for s in out], ttl_s=settings.segment_cache_ttl_s)
     return out
+
+
+_REVIEW_PROMPT = """\
+You are a ruthless short-form QUALITY REVIEWER. For each numbered clip you get
+its EXACT spoken words. Judge each one: if a stranger watches ONLY this clip on
+Instagram, do they get (a) what's happening, (b) why it matters, (c) the full
+explanation, (d) a finished conclusion? Clips may be fixable by moving the
+boundaries a few seconds (start_delta/end_delta, -10..10, 0 if fine).
+Return STRICT JSON: {"reviews": [{"i": <n>, "verdict": "approve"|"reject",
+"start_delta": <s>, "end_delta": <s>, "reason": "<short>"}]}.
+Reject ONLY when unfixable (starts mid-idea with no recoverable setup, no
+conclusion within reach). Approve good clips — don't nitpick."""
+
+
+async def _review_clips(client, transcript: Transcript, segs: list[Segment],
+                        min_s: int, max_s: int) -> list[Segment]:
+    if not segs:
+        return segs
+    settings = get_settings()
+
+    def words_in(a: float, b: float) -> str:
+        return " ".join(w.text for w in transcript.words if a <= w.start < b)
+
+    body = "\n\n".join(f"CLIP {i} [{s.start:.0f}s-{s.end:.0f}s]:\n{words_in(s.start, s.end)}"
+                       for i, s in enumerate(segs))
+    resp = await client.chat.completions.create(
+        model=settings.openai_analysis_model,
+        response_format={"type": "json_object"}, temperature=0.2, max_tokens=800,
+        messages=[{"role": "system", "content": _REVIEW_PROMPT},
+                  {"role": "user", "content": body}])
+    reviews = {int(r.get("i", -1)): r
+               for r in json.loads(resp.choices[0].message.content or "{}").get("reviews", [])}
+
+    kept: list[Segment] = []
+    for i, s in enumerate(segs):
+        r = reviews.get(i)
+        if r is None:
+            kept.append(s)                       # no verdict → don't lose the clip
+            continue
+        if r.get("verdict") == "reject":
+            logger.info("reviewer rejected clip {} ({}s-{}s): {}",
+                        i, round(s.start), round(s.end), r.get("reason", ""))
+            continue
+        ds = max(-10.0, min(10.0, float(r.get("start_delta") or 0)))
+        de = max(-10.0, min(10.0, float(r.get("end_delta") or 0)))
+        if ds or de:                             # nudge, then re-align to clean cuts
+            win = _finalize_window(transcript.words, s.start + ds, s.end + de, min_s, max_s)
+            if win:
+                s = s.model_copy(update={"start": win[0], "end": win[1]})
+        kept.append(s)
+    if not kept:                                 # never 0 clips for a video with speech
+        logger.warning("reviewer rejected ALL clips — keeping top-scored as fallback")
+        kept = [max(segs, key=lambda x: x.score)]
+    return kept
 
 
 def _merge(a: list[Segment], b: list[Segment]) -> list[Segment]:
