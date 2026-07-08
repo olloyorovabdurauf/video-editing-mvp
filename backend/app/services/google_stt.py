@@ -69,6 +69,10 @@ def _client():
     return speech.SpeechClient(credentials=creds)
 
 
+# Languages where the configured model was rejected (per-process memo).
+_MODEL_REJECTED: set[str] = set()
+
+
 def _recognize_sync(content: bytes, language_code: str, model: str
                     ) -> tuple[list[tuple[str, float, float]], str]:
     """Blocking single-chunk recognize → ([(word, start, end)], full_text).
@@ -104,9 +108,16 @@ def _recognize_sync(content: bytes, language_code: str, model: str
         return words, " ".join(t.strip() for t in texts if t.strip())
 
     try:
+        if model and language_code in _MODEL_REJECTED:
+            return _run(None)                             # known-unsupported → skip the doomed try
         return _run(model or None)
     except Exception as e:                                # noqa: BLE001
         if model:
+            # Some languages (e.g. uz-UZ) don't support 'latest_long'. Remember
+            # the rejection so the remaining ~130 chunks of a long video don't
+            # each burn a failed request before falling back.
+            if "not supported" in str(e).lower():
+                _MODEL_REJECTED.add(language_code)
             logger.warning("Google STT model '{}' rejected ({}); retrying default", model, e)
             return _run(None)
         raise
