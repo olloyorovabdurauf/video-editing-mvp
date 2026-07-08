@@ -91,3 +91,45 @@ def test_ytdlp_version_returns_string():
 
 def test_warn_if_stale_does_not_raise():
     ingestion.warn_if_ytdlp_stale()   # never throws regardless of version
+
+
+# ---------------------------------------------------------------------------
+# Audio-first + section downloads (the slow-residential-proxy fast path)
+# ---------------------------------------------------------------------------
+
+from app.config import get_settings
+
+
+def _with_proxy(monkeypatch, value):
+    monkeypatch.setattr(get_settings(), "ytdlp_proxy", value)
+
+
+def test_proxy_for_session_rewrites_webshare_suffix(monkeypatch):
+    _with_proxy(monkeypatch, "http://user-gb-1:pw@p.webshare.io:80")
+    assert ingestion.proxy_for_session(0) == "http://user-gb-1:pw@p.webshare.io:80"
+    assert ingestion.proxy_for_session(2) == "http://user-gb-3:pw@p.webshare.io:80"
+
+
+def test_proxy_for_session_without_proxy_is_none(monkeypatch):
+    _with_proxy(monkeypatch, None)
+    assert ingestion.proxy_for_session(3) is None
+
+
+def test_proxy_for_session_non_session_username_unchanged(monkeypatch):
+    # No trailing "-<n>" → can't derive sessions; fall back to the base proxy.
+    _with_proxy(monkeypatch, "http://plainuser:pw@proxy.example:8080")
+    assert ingestion.proxy_for_session(5) == "http://plainuser:pw@proxy.example:8080"
+
+
+def test_audio_opts_are_audio_only_and_small():
+    opts = ingestion._audio_opts("/tmp/a.%(ext)s", proxy="http://p:1@h:80")
+    assert opts["proxy"] == "http://p:1@h:80"
+    assert opts["format"].startswith("ba[abr<=96]")   # bounded-bitrate audio, no video
+
+
+def test_section_opts_cut_exactly_and_use_session_proxy():
+    opts = ingestion._section_opts("/tmp/s.%(ext)s", 30.0, 90.0, proxy="http://u-gb-2:p@h:80")
+    assert opts["force_keyframes_at_cuts"] is True    # frame-accurate [start,end]
+    assert opts["download_ranges"] is not None
+    assert opts["proxy"] == "http://u-gb-2:p@h:80"
+    assert "height<=1080" in opts["format"]

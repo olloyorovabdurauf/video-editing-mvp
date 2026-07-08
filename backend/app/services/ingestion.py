@@ -162,24 +162,128 @@ def _download_direct(url: str, dst: Path) -> Path:
     )
 
 
-def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
-    import yt_dlp
-
-    settings = get_settings()
-    ydl_opts = {
+def _base_ydl_opts(out_tmpl: str, *, proxy: str | None) -> dict:
+    opts = {
         "outtmpl": out_tmpl,
-        "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
-        "merge_output_format": "mp4",
         "quiet": True, "noprogress": True,
         "socket_timeout": 30,
         "retries": 5, "extractor_retries": 3, "fragment_retries": 10,
         "concurrent_fragment_downloads": 4,
     }
-    if settings.ytdlp_proxy:
-        ydl_opts["proxy"] = settings.ytdlp_proxy
+    if proxy:
+        opts["proxy"] = proxy
+    return opts
+
+
+def _download_via_ytdlp(url: str, out_tmpl: str) -> Path:
+    import yt_dlp
+
+    ydl_opts = {
+        **_base_ydl_opts(out_tmpl, proxy=get_settings().ytdlp_proxy),
+        "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+        "merge_output_format": "mp4",
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+
+
+# ---------------------------------------------------------------------------
+# Fast path for platform videos behind the (slow, GB-metered) residential
+# proxy: pull ONLY the audio for transcription/analysis, then ONLY the video
+# sections the AI actually selected. A 60-min video drops from ~800MB to
+# ~25MB (audio) + ~20MB per clip — and the sections download in PARALLEL
+# across distinct proxy sessions, so line speeds aggregate.
+# ---------------------------------------------------------------------------
+
+def proxy_for_session(k: int) -> str | None:
+    """
+    Derive a distinct sticky-session proxy URL from the configured one.
+    Webshare-style usernames end in "-<session>" (e.g. user-gb-1); each session
+    number is a different residential exit line. Rewriting the suffix lets
+    parallel downloads use separate lines instead of queueing on one.
+    Falls back to the base proxy when the format doesn't match.
+    """
+    base = get_settings().ytdlp_proxy
+    if not base or k <= 0:
+        return base
+    m = re.match(r"^(https?://)([^:@/]+):([^@/]+)@(.+)$", base)
+    if not m:
+        return base
+    scheme, user, pw, host = m.groups()
+    m2 = re.match(r"^(.*-)(\d+)$", user)
+    if not m2:
+        return base
+    return f"{scheme}{m2.group(1)}{int(m2.group(2)) + k}:{pw}@{host}"
+
+
+def _audio_opts(out_tmpl: str, *, proxy: str | None) -> dict:
+    # ~48-96kbps voice audio is all Whisper needs; ~25MB/hour vs 800MB/hour.
+    return {
+        **_base_ydl_opts(out_tmpl, proxy=proxy),
+        "format": "ba[abr<=96]/wa[abr>=48]/ba/b",
+    }
+
+
+def _section_opts(out_tmpl: str, start: float, end: float, *, proxy: str | None) -> dict:
+    from yt_dlp.utils import download_range_func
+
+    return {
+        **_base_ydl_opts(out_tmpl, proxy=proxy),
+        "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+        "merge_output_format": "mp4",
+        "download_ranges": download_range_func(None, [(start, end)]),
+        # Re-encode the section to EXACTLY [start, end] — the output then IS
+        # the frame-accurate cut, so the render pipeline skips its cut pass.
+        "force_keyframes_at_cuts": True,
+    }
+
+
+def download_audio(url: str, work_dir: Path) -> Path:
+    """Audio-only download for transcription (platform URLs)."""
+    import yt_dlp
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with yt_dlp.YoutubeDL(_audio_opts(str(work_dir / "audio.%(ext)s"),
+                                          proxy=get_settings().ytdlp_proxy)) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = Path(ydl.prepare_filename(info))
+    except IngestionError:
+        raise
+    except Exception as e:
+        raise _to_user_error(e) from e
+    if not path.exists() or path.stat().st_size == 0:
+        raise IngestionError("The download produced no audio. Please check the URL.")
+    return path
+
+
+def download_section(url: str, work_dir: Path, index: int,
+                     start: float, end: float, *, session: int = 0) -> Path:
+    """
+    Download one selected window of the video, frame-accurate, through its own
+    proxy session. Returns the ready-to-use clip file (already cut to [start, end]).
+    """
+    import yt_dlp
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    tmpl = str(work_dir / f"section_{index}.%(ext)s")
+    try:
+        with yt_dlp.YoutubeDL(_section_opts(tmpl, start, end,
+                                            proxy=proxy_for_session(session))) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+    except IngestionError:
+        raise
+    except Exception as e:
+        raise _to_user_error(e) from e
+    if not path.exists():
+        # yt-dlp may decorate section filenames — recover by prefix.
+        candidates = sorted(work_dir.glob(f"section_{index}*.mp4"))
+        path = candidates[0] if candidates else path
+    if not path.exists() or path.stat().st_size == 0:
+        raise IngestionError("The section download produced no file.")
+    return path
 
 
 def _to_user_error(e: Exception) -> IngestionError:

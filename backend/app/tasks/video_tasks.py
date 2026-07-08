@@ -202,11 +202,25 @@ def t_download(self, job_id: str, payload: dict) -> dict:
     work = settings.storage_local_dir / "raw" / job_id
     work.mkdir(parents=True, exist_ok=True)
 
+    audio_only = False
     try:
         if req.is_upload:
             src = ingestion.fetch_upload(req.upload_key, work)
-        else:
+        elif ingestion.looks_like_direct_media(str(req.source_url)):
             src = ingestion.download_source(str(req.source_url), work)
+        else:
+            # Platform URL (YouTube/…): audio-first. The full video is never
+            # pulled — render fetches ONLY the AI-selected sections later.
+            # Through the metered ~300KB/s residential proxy this is the
+            # difference between ~90s and ~25min for a long video.
+            try:
+                src = ingestion.download_audio(str(req.source_url), work)
+                audio_only = True
+            except ingestion.IngestionError:
+                raise
+            except Exception:
+                logger.exception("audio-first download failed; falling back to full")
+                src = ingestion.download_source(str(req.source_url), work)
     except ingestion.IngestionError as e:
         logger.warning("ingestion failed for job {}: {}", job_id, e)
         # Retry transient blocks (403/429/timeout); fail permanent ones (private,
@@ -216,7 +230,8 @@ def t_download(self, job_id: str, payload: dict) -> dict:
         _update(job_id, status=ReelJobStatus.FAILED.value, message=e.user_message)
         raise
 
-    return {"job_id": job_id, "payload": payload, "source_path": str(src)}
+    return {"job_id": job_id, "payload": payload, "source_path": str(src),
+            "audio_only": audio_only, "source_url": str(req.source_url or "")}
 
 
 @shared_task(name="pipeline.transcribe", queue="ai", bind=True, max_retries=2)
@@ -304,7 +319,8 @@ def t_render(self, ctx: dict) -> dict:
 
     _update(ctx["job_id"], status=ReelJobStatus.RENDERING.value, progress=0.60,
             total_clips=len(segments), completed_clips=0,
-            message=f"rendering {len(segments)} clips")
+            message=(f"fetching + rendering {len(segments)} clips"
+                     if ctx.get("audio_only") else f"rendering {len(segments)} clips"))
 
     # Render ALL clips CONCURRENTLY (was a sequential loop — the multi-clip
     # bottleneck). Each clip streams into job state the instant it finishes, so
@@ -442,8 +458,19 @@ async def _render_segment(i, seg, *, ctx, req, source, raw_transcript, out_dir,
     translated_text: str | None = None         # reused for metadata if captions translate
 
     # 1. Cut (re-encode for frame-accurate boundaries).
-    cut_path = out_dir / f"seg_{i}_cut.mp4"
-    await ff.cut(source, cut_path, start=seg.start, end=seg.end, reencode=True)
+    #    Audio-only jobs never downloaded the video — fetch JUST this clip's
+    #    window instead (already frame-accurate via force_keyframes_at_cuts),
+    #    each clip through its own proxy session so downloads run in parallel
+    #    on separate residential lines. Falls back to nothing: a section
+    #    failure only skips this clip, the others keep rendering.
+    if ctx.get("audio_only"):
+        raw_dir = settings.storage_local_dir / "raw" / ctx["job_id"]
+        cut_path = await asyncio.to_thread(
+            ingestion.download_section, ctx["source_url"], raw_dir, i,
+            seg.start, seg.end, session=i)
+    else:
+        cut_path = out_dir / f"seg_{i}_cut.mp4"
+        await ff.cut(source, cut_path, start=seg.start, end=seg.end, reencode=True)
     current = cut_path
 
     # 2. Reframe — smart crop for vertical, identity for horizontal.
