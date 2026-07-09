@@ -188,7 +188,7 @@ async def pick_segments(
 
     # v4: invalidates clips cached before the hierarchical rubric (new score
     # dimensions + standalone gate change which clips win).
-    ck = ai_cache.key("segpick_v8", compressed, n, min_eff, max_duration_s, prompt or "")
+    ck = ai_cache.key("segpick_v9", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
@@ -257,9 +257,21 @@ async def pick_segments(
     # AGENT 4 — Quality Reviewer with a delivery CONTRACT: reviews the top n,
     # replaces rejects from the scored bench (then fresh windows), and never
     # returns fewer than n while the source has material.
-    out = pool[:n]
+    # Semantic Ending Detection: stop each clip at the FIRST strong natural
+    # ending (payoff/lesson/quote/emotional landing) — trailing examples,
+    # repetition and topic changes belong to the NEXT clip. Runs between
+    # boundary repair and QA review; only ever trims, never extends.
+    primary = pool[:n]
     try:
-        out = await _review_clips(client, transcript, pool[:n], min_eff, max_duration_s,
+        from app.services import ending_detector
+        primary = await ending_detector.refine_endings(
+            client, transcript, primary, min_s=min_eff)
+    except Exception as e:
+        logger.warning("ending detector failed (keeping boundaries): {}", e)
+
+    out = primary
+    try:
+        out = await _review_clips(client, transcript, primary, min_eff, max_duration_s,
                                   want=n, bench=pool[n:])
     except Exception as e:
         logger.warning("quality reviewer failed (keeping picks): {}", e)

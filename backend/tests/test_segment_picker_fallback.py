@@ -221,7 +221,7 @@ async def test_low_standalone_is_gated_then_escalates():
         oai.return_value.chat.completions.create = create
         out = await sp.pick_segments(t, n=1, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
     assert len(out) == 1 and out[0].standalone_score == 0.85
-    assert create.call_count == 3                  # escalated (+1 reviewer pass)
+    assert create.call_count == 4                  # escalated (+ending detector +reviewer)
 
 
 @pytest.mark.asyncio
@@ -283,7 +283,7 @@ async def test_accumulates_distinct_clips_toward_n():
         create = AsyncMock(side_effect=[cheap, esc, fill])
         oai.return_value.chat.completions.create = create
         out = await sp.pick_segments(t, n=5, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
-    assert create.call_count == 4                 # escalated + filled (+1 reviewer pass)
+    assert create.call_count == 5                 # escalated + filled (+detector +reviewer)
     assert len(out) == 3                          # 3 distinct clips gathered
     starts = [s.start for s in out]
     assert starts == sorted(starts)               # returned chronologically
@@ -318,7 +318,7 @@ async def test_stops_escalating_once_n_met():
         create = AsyncMock(side_effect=[cheap])
         oai.return_value.chat.completions.create = create
         out = await sp.pick_segments(t, n=3, min_duration_s=MIN, max_duration_s=MAX, prompt=None)
-    assert create.call_count == 2                 # cheap pass + reviewer only — no escalation
+    assert create.call_count == 3                 # cheap + detector + reviewer — no escalation
     assert len(out) == 3
 
 
