@@ -428,3 +428,15 @@ def test_idea_end_past_max_beats_infield_sentence():
     win = _finalize_window(words, 0.0, 67.0, 45, 60)
     assert win is not None
     assert win[1] >= 66.0                    # took the idea's true ending
+
+
+def test_pause_marks_thought_boundary_without_punctuation():
+    """Audio signal: a long speech pause is a thought end even with no '.'"""
+    from app.services.segment_picker import _boundaries
+    from app.services.transcription import Word
+    words = [Word(text="w", start=0.0, end=0.9), Word(text="w", start=1.0, end=1.9),
+             Word(text="w", start=2.0, end=2.9),           # then a 1.2s pause
+             Word(text="w", start=4.1, end=5.0)]
+    starts, ends = _boundaries(words)
+    assert 2.9 in ends                       # pause after this word = boundary
+    assert 4.1 in starts                     # next word starts a new thought

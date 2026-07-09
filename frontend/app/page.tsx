@@ -61,7 +61,7 @@ export default function HomePage() {
         aspect: "9:16",
         target_count: count,
         min_duration_s: 45,
-        max_duration_s: 60,
+        max_duration_s: 75,
         language: language === "auto" ? undefined : language,
         caption_style: captions ? "karaoke" : "none",
         smart_crop: true,

@@ -188,7 +188,7 @@ async def pick_segments(
 
     # v4: invalidates clips cached before the hierarchical rubric (new score
     # dimensions + standalone gate change which clips win).
-    ck = ai_cache.key("segpick_v6", compressed, n, min_eff, max_duration_s, prompt or "")
+    ck = ai_cache.key("segpick_v7", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
@@ -413,15 +413,23 @@ def _is_sentence_end(text: str) -> bool:
     return bool(t) and t[-1] in ".!?…"
 
 
+# A speech gap this long marks a thought boundary even without punctuation.
+# This is the first AUDIO signal in boundary detection: speakers pause where
+# they land a message. Whisper words often carry no punctuation at all — pauses
+# are then the only true "sentence end" evidence in the data.
+_PAUSE_BOUNDARY_S = 0.8
+
+
 def _boundaries(words: list[Word]) -> tuple[list[float], list[float]]:
-    """Times where sentences START and END, from word punctuation."""
+    """Times where thoughts START and END: punctuation + real speech pauses."""
     starts: list[float] = []
     ends: list[float] = []
     new_sentence = True
-    for w in words:
+    for i, w in enumerate(words):
         if new_sentence:
             starts.append(w.start)
-        if _is_sentence_end(w.text):
+        gap_after = (words[i + 1].start - w.end) if i + 1 < len(words) else 0.0
+        if _is_sentence_end(w.text) or gap_after >= _PAUSE_BOUNDARY_S:
             ends.append(w.end)
             new_sentence = True
         else:

@@ -40,7 +40,7 @@ class ReelCreateRequest(BaseModel):
     target_count: int = Field(3, ge=1, le=10, description="How many reels to extract")
     # Clips are COMPLETE short-form pieces (full hook→context→value→payoff arc),
     # not highlight fragments. Default 45-60s so each works as a standalone Reel.
-    max_duration_s: int = Field(60, ge=15, le=180)
+    max_duration_s: int = Field(75, ge=15, le=180)   # 45-75s target; meaning still wins
     min_duration_s: int = Field(45, ge=15, le=120,
                                 description="Floor so clips are complete, not 5-10s hooks")
 
