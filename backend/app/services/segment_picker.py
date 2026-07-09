@@ -188,13 +188,16 @@ async def pick_segments(
 
     # v4: invalidates clips cached before the hierarchical rubric (new score
     # dimensions + standalone gate change which clips win).
-    ck = ai_cache.key("segpick_v7", compressed, n, min_eff, max_duration_s, prompt or "")
+    ck = ai_cache.key("segpick_v8", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
         return [Segment(**d) for d in cached]
 
     value_end = max(min_eff, max_duration_s - 15)
+    # THE COUNT IS A CONTRACT: generate a 3x candidate surplus so reviewer
+    # rejections and dedupe always have replacements to draw from.
+    cand_n = min(15, max(3 * n, 9))
 
     async def _ask(model: str, system: str, temperature: float, min_completeness: float) -> list[Segment]:
         resp = await client.chat.completions.create(
@@ -218,8 +221,8 @@ async def pick_segments(
         picks.sort(key=lambda x: x.score, reverse=True)
         return picks
 
-    strict = SYSTEM_PROMPT.format(n=n, min_dur=min_eff, max_dur=max_duration_s, value_end=value_end)
-    fill = FILL_SYSTEM_PROMPT.format(n=n, min_dur=min_eff, max_dur=max_duration_s, value_end=value_end)
+    strict = SYSTEM_PROMPT.format(n=cand_n, min_dur=min_eff, max_dur=max_duration_s, value_end=value_end)
+    fill = FILL_SYSTEM_PROMPT.format(n=cand_n, min_dur=min_eff, max_dur=max_duration_s, value_end=value_end)
 
     out: list[Segment] = []
     try:
@@ -239,28 +242,28 @@ async def pick_segments(
     except Exception as e:
         logger.warning("segment analysis failed: {}", e)
 
-    out = _dedupe_overlap(out)                 # drop near-duplicate / overlapping windows
-    # Guarantee the requested count on a long-enough video: if the AI under-
-    # delivered, take complete 45-60s windows from evenly-spaced regions it didn't
-    # already cover. A human editor does the same — one from each part of the talk.
-    if len(out) < n:
-        logger.info("AI gave {}/{} → distributing clips across the timeline", len(out), n)
-        out = _dedupe_overlap(_distribute_clips(transcript, out, n, min_eff, max_duration_s))
-    out.sort(key=lambda x: x.score, reverse=True)
-    out = out[:n]
-    out.sort(key=lambda x: x.start)            # chronological order for the user
+    pool = _dedupe_overlap(out)                # distinct scored candidates
+    # Ensure the pool covers the contract even before review: complete windows
+    # from timeline regions the AI didn't cover (a human editor does the same).
+    if len(pool) < n:
+        logger.info("AI gave {}/{} candidates → distributing across the timeline", len(pool), n)
+        pool = _dedupe_overlap(_distribute_clips(transcript, pool, n, min_eff, max_duration_s))
+    pool.sort(key=lambda x: x.score, reverse=True)
 
-    if not out:
+    if not pool:
         synth = _synthesize_from_transcript(transcript, min_eff, max_duration_s)
-        out = [synth] if synth else []
+        pool = [synth] if synth else []
 
-    # AGENT 4 — Quality Reviewer: re-read each FINALIZED clip's exact words
-    # (not the compressed buckets it was picked from) and veto/nudge before
-    # anything renders. This is the "would a cold viewer understand?" gate.
+    # AGENT 4 — Quality Reviewer with a delivery CONTRACT: reviews the top n,
+    # replaces rejects from the scored bench (then fresh windows), and never
+    # returns fewer than n while the source has material.
+    out = pool[:n]
     try:
-        out = await _review_clips(client, transcript, out, min_eff, max_duration_s)
+        out = await _review_clips(client, transcript, pool[:n], min_eff, max_duration_s,
+                                  want=n, bench=pool[n:])
     except Exception as e:
         logger.warning("quality reviewer failed (keeping picks): {}", e)
+    out.sort(key=lambda x: x.start)            # chronological order for the user
 
     if out:
         ai_cache.set_json(ck, [s.model_dump() for s in out], ttl_s=settings.segment_cache_ttl_s)
@@ -298,15 +301,23 @@ clips — don't nitpick."""
 
 
 async def _review_clips(client, transcript: Transcript, segs: list[Segment],
-                        min_s: int, max_s: int) -> list[Segment]:
+                        min_s: int, max_s: int, *,
+                        want: int | None = None,
+                        bench: list[Segment] | tuple = ()) -> list[Segment]:
+    """Agent 4 with a DELIVERY CONTRACT: reviews candidates, replaces rejects
+    from the scored bench (then fresh timeline windows), and — as long as the
+    source has material — never returns fewer than `want` clips. Top-ups that
+    exhaust review rounds ship the best unreviewed candidates (logged) rather
+    than violating the requested count."""
     if not segs:
-        return segs
+        return list(segs)
+    want = want or len(segs)
     settings = get_settings()
 
     def words_in(a: float, b: float) -> str:
         return " ".join(w.text for w in transcript.words if a <= w.start < b)
 
-    async def review_round(cands: list[Segment]) -> tuple[list[Segment], int]:
+    async def review_round(cands: list[Segment]) -> list[Segment]:
         body = "\n\n".join(
             f"CLIP {i} [{s.start:.0f}s-{s.end:.0f}s]\n"
             f"PRE: {words_in(max(0.0, s.start - 15), s.start)}\n"
@@ -321,41 +332,62 @@ async def _review_clips(client, transcript: Transcript, segs: list[Segment],
         reviews = {int(r.get("i", -1)): r
                    for r in json.loads(resp.choices[0].message.content or "{}").get("reviews", [])}
         approved: list[Segment] = []
-        rejects = 0
-        for i, s in enumerate(cands):
+        for i, seg in enumerate(cands):
             r = reviews.get(i)
             if r is None:
-                approved.append(s)               # no verdict → don't lose the clip
+                approved.append(seg)             # no verdict → don't lose the clip
                 continue
             if r.get("verdict") == "reject":
-                rejects += 1
                 logger.info("reviewer rejected clip {} ({}s-{}s): {}",
-                            i, round(s.start), round(s.end), r.get("reason", ""))
+                            i, round(seg.start), round(seg.end), r.get("reason", ""))
                 continue
             ds = max(-30.0, min(30.0, float(r.get("start_delta") or 0)))
             de = max(-30.0, min(30.0, float(r.get("end_delta") or 0)))
             if ds or de:                         # nudge, then re-align to clean cuts
-                win = _finalize_window(transcript.words, s.start + ds, s.end + de, min_s, max_s)
+                win = _finalize_window(transcript.words, seg.start + ds, seg.end + de, min_s, max_s)
                 if win:
-                    s = s.model_copy(update={"start": win[0], "end": win[1]})
-            approved.append(s)
-        return approved, rejects
+                    seg = seg.model_copy(update={"start": win[0], "end": win[1]})
+            approved.append(seg)
+        return approved
 
-    want = len(segs)
-    kept, rejects = await review_round(segs)
+    def _fresh_from(cands: list[Segment], kept: list[Segment], need: int) -> list[Segment]:
+        out: list[Segment] = []
+        for c in cands:
+            if len(out) >= need:
+                break
+            if all(abs(c.start - k.start) > 1.0 for k in kept + out):
+                out.append(c)
+        return out
 
-    # "Choose another story": rejects left us short → pick complete windows from
-    # story regions not already covered, and put THOSE through review too.
-    if rejects and len(kept) < want:
-        pool = _dedupe_overlap(_distribute_clips(transcript, kept, want, min_s, max_s))
-        fresh = [s for s in pool if all(abs(s.start - k.start) > 1.0 for k in kept)][: want - len(kept)]
-        if fresh:
-            logger.info("reviewer: sourcing {} replacement clip(s) from uncovered stories", len(fresh))
-            approved2, _ = await review_round(fresh)
-            kept = _dedupe_overlap(kept + approved2)
+    kept = await review_round(segs)
+    bench_left = list(bench)
 
-    if not kept:                                 # never 0 clips for a video with speech
-        logger.warning("reviewer rejected ALL clips — keeping top-scored as fallback")
+    # Replacement rounds: rejects are REPLACED (bench first, then fresh windows
+    # from uncovered story regions), and replacements are reviewed too.
+    rounds = 0
+    while len(kept) < want and rounds < 2:
+        rounds += 1
+        fresh = _fresh_from(bench_left, kept, want - len(kept))
+        bench_left = [b for b in bench_left if b not in fresh]
+        if len(fresh) < want - len(kept):
+            pool = _dedupe_overlap(_distribute_clips(transcript, kept + fresh, want, min_s, max_s))
+            fresh += _fresh_from(pool, kept + fresh, want - len(kept) - len(fresh))
+        if not fresh:
+            break
+        logger.info("reviewer: sourcing {} replacement clip(s), round {}", len(fresh), rounds)
+        kept += await review_round(fresh)
+
+    # CONTRACT TOP-UP: review rounds exhausted → ship best unreviewed material
+    # rather than under-deliver. Logged so quality regressions stay visible.
+    if len(kept) < want:
+        spare = list(bench_left) + list(_distribute_clips(transcript, kept, want, min_s, max_s))
+        spare.sort(key=lambda x: x.score, reverse=True)
+        for c in _fresh_from(spare, kept, want - len(kept)):
+            logger.warning("contract top-up: delivering unreviewed candidate {}s-{}s",
+                           round(c.start), round(c.end))
+            kept.append(c)
+
+    if not kept:                                 # pathological: empty transcript material
         kept = [max(segs, key=lambda x: x.score)]
     kept.sort(key=lambda x: x.start)
     return kept[:want]

@@ -440,3 +440,81 @@ def test_pause_marks_thought_boundary_without_punctuation():
     starts, ends = _boundaries(words)
     assert 2.9 in ends                       # pause after this word = boundary
     assert 4.1 in starts                     # next word starts a new thought
+
+
+# ---------------------------------------------------------------------------
+# THE COUNT IS A CONTRACT — request N, receive exactly N
+# ---------------------------------------------------------------------------
+
+def _contract_setup(reject_indices=()):
+    import json as _json
+    from types import SimpleNamespace
+    from app.services.transcription import Transcript, Word
+    words = [Word(text=("stop." if i % 20 == 4 else "w"), start=float(i), end=i + 0.95)
+             for i in range(600)]                        # 10 min of material
+    tr = Transcript(language="en", text="x", words=words)
+    calls = {"n": 0}
+    async def fake_create(**kw):
+        calls["n"] += 1
+        body = kw["messages"][1]["content"]
+        n_clips = body.count("CLIP ")
+        reviews = [{"i": i, "verdict": ("reject" if (calls["n"] == 1 and i in reject_indices)
+                                        else "approve"),
+                    "start_delta": 0, "end_delta": 0, "reason": "t"} for i in range(n_clips)]
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=_json.dumps({"reviews": reviews})))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+    return tr, client
+
+
+def _cseg(start, score):
+    from app.schemas.reel import Segment
+    return Segment(start=float(start), end=float(start) + 50.0, transcript="", score=score)
+
+
+import pytest
+
+
+@pytest.mark.parametrize("want", [3, 5, 8])
+def test_contract_returns_exactly_n(want):
+    import asyncio
+    from app.services import segment_picker as sp
+    tr, client = _contract_setup()
+    primary = [_cseg(60 * i, 0.9 - 0.01 * i) for i in range(want)]
+    bench = [_cseg(60 * (want + j) , 0.5) for j in range(4)]
+    out = asyncio.run(sp._review_clips(client, tr, primary, 45, 75, want=want, bench=bench))
+    assert len(out) == want
+
+
+def test_contract_reject_is_replaced_not_dropped():
+    import asyncio
+    from app.services import segment_picker as sp
+    tr, client = _contract_setup(reject_indices={1})     # reviewer rejects clip 1 in round 1
+    primary = [_cseg(0, 0.9), _cseg(120, 0.8), _cseg(240, 0.7)]
+    bench = [_cseg(360, 0.6), _cseg(480, 0.55)]
+    out = asyncio.run(sp._review_clips(client, tr, primary, 45, 75, want=3, bench=bench))
+    assert len(out) == 3                                 # count preserved
+    assert all(abs(s.start - 120.0) > 1.0 for s in out)  # the rejected window is gone
+
+
+def test_contract_topup_when_everything_rejected():
+    import asyncio
+    from app.services import segment_picker as sp
+    # Reviewer rejects EVERYTHING in every round → contract top-up must still
+    # deliver the requested count from unreviewed material (never 1-of-3).
+    import json as _json
+    from types import SimpleNamespace
+    from app.services.transcription import Transcript, Word
+    words = [Word(text=("stop." if i % 20 == 4 else "w"), start=float(i), end=i + 0.95)
+             for i in range(600)]
+    tr = Transcript(language="en", text="x", words=words)
+    async def always_reject(**kw):
+        n_clips = kw["messages"][1]["content"].count("CLIP ")
+        reviews = [{"i": i, "verdict": "reject", "start_delta": 0, "end_delta": 0,
+                    "reason": "t"} for i in range(n_clips)]
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=_json.dumps({"reviews": reviews})))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=always_reject)))
+    primary = [_cseg(0, 0.9), _cseg(120, 0.8), _cseg(240, 0.7)]
+    out = asyncio.run(sp._review_clips(client, tr, primary, 45, 75, want=3, bench=[]))
+    assert len(out) == 3

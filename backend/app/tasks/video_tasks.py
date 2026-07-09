@@ -440,13 +440,21 @@ async def _render_all(ctx, req, segments, raw_transcript, out_dir, broll_dir,
 
     async def worker(i: int, seg: Segment) -> None:
         async with sem:
-            try:
-                art = await _render_segment(
-                    i, seg, ctx=ctx, req=req, source=source, raw_transcript=raw_transcript,
-                    out_dir=out_dir, broll_dir=broll_dir, target_dims=target_dims,
-                    is_vertical=is_vertical, crop_lock=crop_lock)
-            except Exception as e:                       # one clip failing must not sink the rest
-                logger.warning("clip {} render failed, skipping: {}", i, e)
+            # THE COUNT IS A CONTRACT: transient ffmpeg/download hiccups get a
+            # full second attempt before a clip may be lost — and a loss is
+            # loud, never silent.
+            art = None
+            for attempt in (1, 2):
+                try:
+                    art = await _render_segment(
+                        i, seg, ctx=ctx, req=req, source=source, raw_transcript=raw_transcript,
+                        out_dir=out_dir, broll_dir=broll_dir, target_dims=target_dims,
+                        is_vertical=is_vertical, crop_lock=crop_lock)
+                    break
+                except Exception as e:                   # one clip failing must not sink the rest
+                    logger.warning("clip {} render attempt {} failed: {}", i, attempt, e)
+            if art is None:
+                logger.error("clip {} PERMANENTLY failed after retry — job under-delivers", i)
                 return
             results[i] = art
             _commit_clip(ctx["job_id"], art, total)      # stream it to the UI now
