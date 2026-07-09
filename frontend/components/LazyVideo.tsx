@@ -13,8 +13,18 @@ import { useEffect, useRef, useState } from "react";
  */
 export function LazyVideo({ src, poster }: { src: string; poster?: string | null }) {
   const ref = useRef<HTMLDivElement>(null);
+  const vidRef = useRef<HTMLVideoElement>(null);
   const [near, setNear] = useState(false);   // scrolled close to viewport
   const [active, setActive] = useState(false); // user pressed play → load full video
+
+  // Mobile-safe start: the `autoplay` attribute is unreliable on iOS/Android —
+  // the element mounts on a re-render, so the browser no longer ties it to the
+  // user's tap and blocks it (leaving a blank card). Explicitly call play();
+  // if the browser still refuses, the poster + native controls stay visible
+  // and one more tap on the control plays.
+  useEffect(() => {
+    if (active) vidRef.current?.play().catch(() => {});
+  }, [active]);
 
   useEffect(() => {
     const el = ref.current;
@@ -36,9 +46,10 @@ export function LazyVideo({ src, poster }: { src: string; poster?: string | null
     <div ref={ref} className="relative h-full w-full">
       {active ? (
         <video
+          ref={vidRef}
           src={src}
           controls
-          autoPlay
+          playsInline
           preload="metadata"
           poster={poster || undefined}
           className="h-full w-full object-contain"
