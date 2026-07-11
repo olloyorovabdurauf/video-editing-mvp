@@ -298,9 +298,19 @@ def _to_user_error(e: Exception) -> IngestionError:
             "Try again in a minute — if it keeps happening, upload the file directly.",
             retryable=True, cause=e,
         )
+    if "402" in msg or "payment required" in msg:
+        # The residential proxy plan is out of bandwidth/payment (Webshare 402).
+        # Retrying can't help until the plan is topped up — fail honestly.
+        return IngestionError(
+            "Our video download service is temporarily out of capacity. "
+            "We're restoring it — please try again soon, or upload the file directly.",
+            retryable=False, cause=e,
+        )
     if "private" in msg or "unavailable" in msg or "removed" in msg or "does not exist" in msg:
         return IngestionError("This video is private, removed, or region-locked.", cause=e)
-    if "sign in" in msg or "age" in msg or "login" in msg or "confirm your age" in msg:
+    # NOTE: match precise phrases — a bare "age" substring matched "API pAGE"
+    # and mislabeled proxy failures as age-restriction.
+    if "sign in" in msg or "age-restricted" in msg or "confirm your age" in msg or "login required" in msg:
         return IngestionError("This video requires sign-in (age-restricted) and can't be processed.", cause=e)
     if "403" in msg or "forbidden" in msg or "bot" in msg or "429" in msg or "too many requests" in msg:
         return IngestionError(

@@ -133,3 +133,14 @@ def test_section_opts_cut_exactly_and_use_session_proxy():
     assert opts["download_ranges"] is not None
     assert opts["proxy"] == "http://u-gb-2:p@h:80"
     assert "height<=1080" in opts["format"]
+
+
+def test_proxy_402_maps_to_capacity_message_not_age():
+    """Webshare 402 ("Unable to download API page ... 402 Payment Required")
+    must report capacity — the bare "age" substring used to match "API pAGE"."""
+    err = ingestion._to_user_error(Exception(
+        "ERROR: [youtube] x: Unable to download API page: ('Unable to connect to proxy', "
+        "OSError('Tunnel connection failed: 402 Payment Required'))"))
+    assert "capacity" in err.user_message.lower()
+    assert "age" not in err.user_message.lower().replace("capacity", "")
+    assert err.retryable is False
