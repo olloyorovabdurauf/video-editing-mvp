@@ -113,8 +113,14 @@ def _on_task_failure(sender=None, task_id=None, exception=None, **kw):
         from app.services import billing as _billing
         if state.get("credit_hold_id") and state.get("user_id") not in (None, "anonymous"):
             _billing.refund(state["user_id"], state["credit_hold_id"])
-        msg = (_AI_QUOTA_MSG if _is_quota_error(exception)
-               else f"{sender.name if sender else 'unknown'}: {exception}")
+        if _is_quota_error(exception):
+            msg = _AI_QUOTA_MSG
+        elif hasattr(exception, "user_message"):
+            # IngestionError et al carry a clean user-facing message — show
+            # THAT, not the raw provider traceback with yt-dlp noise.
+            msg = exception.user_message
+        else:
+            msg = f"{sender.name if sender else 'unknown'}: {exception}"
         _update(job_id, status=ReelJobStatus.FAILED.value, message=msg)
         _purge_job_files(job_id)        # don't leak the download of a failed job
     except Exception as e:
