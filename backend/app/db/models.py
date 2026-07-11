@@ -199,6 +199,24 @@ class LedgerEntry(Base):
     __table_args__ = (Index("ix_ledger_user", "user_id"),)
 
 
+class ClipFeedback(Base):
+    """
+    Per-clip user feedback (thumbs up/down + reason). The raw signal for
+    quality iteration: which pipeline failures users actually notice.
+    """
+    __tablename__ = "clip_feedback"
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    job_id: Mapped[str] = mapped_column(String(32), index=True)
+    clip_index: Mapped[int] = mapped_column(Integer)
+    verdict: Mapped[str] = mapped_column(String(8))           # up|down
+    reason: Mapped[str | None] = mapped_column(String(32))    # story_incomplete|weak_hook|...
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_feedback_job_clip", "job_id", "clip_index"),)
+
+
 class UsageCounter(Base):
     """
     Per-user, per-period rollup for quotas + billing analytics. One row per

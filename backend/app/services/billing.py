@@ -46,7 +46,8 @@ _r = redis.from_url(get_settings().redis_url, decode_responses=True)
 # ---------------------------------------------------------------------------
 
 PRICING_CREDITS = {
-    "reel_base":      25,    # one reel render
+    "reel_base":      10,    # one reel render
+    "source_minute":   2,    # per minute of source audio (the real COGS driver)
     "ai_broll_gen":   60,    # one generation call (Runway-priced)
     "smart_crop":      5,    # face-tracked vertical crop
     "stock_broll":     0,    # Pexels — free; we eat the rate limit
@@ -66,7 +67,9 @@ def estimate_job_credits(
         per_reel += PRICING_CREDITS["smart_crop"]
     if use_ai_broll:
         per_reel += PRICING_CREDITS["ai_broll_gen"] * avg_brolls_per_reel
-    return per_reel * target_count
+    # Source duration is unknown at enqueue — hold for a typical ~30-min video;
+    # settle() charges the true minutes afterwards (capped at 3x this hold).
+    return per_reel * target_count + PRICING_CREDITS["source_minute"] * 30
 
 
 # ---------------------------------------------------------------------------

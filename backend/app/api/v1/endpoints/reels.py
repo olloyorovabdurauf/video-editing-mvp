@@ -2,7 +2,11 @@
 POST /api/v1/reels        — enqueue a job, return job_id
 GET  /api/v1/reels/{id}   — poll status / get artifacts (owner only)
 """
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from loguru import logger
+from pydantic import BaseModel, Field as PydField
 
 from app.config import get_settings
 from app.core.auth import require_user
@@ -80,3 +84,27 @@ async def read_reel(
     if job is None or get_job_owner(job_id) != user_id:
         raise HTTPException(404, "job not found")
     return job
+
+
+class FeedbackRequest(BaseModel):
+    clip_index: int = PydField(ge=0, le=50)
+    verdict: Literal["up", "down"]
+    reason: Literal["story_incomplete", "weak_hook", "wrong_crop", "subtitle_issue",
+                    "wrong_language", "not_viral", "render_quality", "other", ""] | None = None
+
+
+@router.post("/{job_id}/feedback", status_code=204)
+async def clip_feedback(
+    job_id: str,
+    body: FeedbackRequest,
+    user_id: str = Depends(require_user),
+) -> None:
+    """Per-clip 👍/👎 + reason — the quality-iteration signal (Task 7)."""
+    if get_job(job_id) is None or get_job_owner(job_id) != user_id:
+        raise HTTPException(404, "job not found")
+    from app.db import repositories as repo
+    stored = repo.record_feedback(user_id, job_id=job_id, clip_index=body.clip_index,
+                                  verdict=body.verdict, reason=body.reason or None)
+    # DB-less deploys still capture the signal in logs.
+    logger.info("feedback job={} clip={} verdict={} reason={} stored={}",
+                job_id, body.clip_index, body.verdict, body.reason, stored)

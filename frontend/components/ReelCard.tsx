@@ -1,6 +1,7 @@
 "use client";
 
 import { type ReelArtifact } from "@/lib/api";
+import { ClipFeedback } from "@/components/ClipFeedback";
 import { CopyButton } from "@/components/CopyButton";
 import { LazyVideo } from "@/components/LazyVideo";
 
@@ -16,7 +17,7 @@ function scoreColor(score: number) {
   return "text-white/60 border-white/15 bg-white/5";
 }
 
-export function ReelCard({ reel, index }: { reel: ReelArtifact; index: number }) {
+export function ReelCard({ reel, index, jobId }: { reel: ReelArtifact; index: number; jobId?: string }) {
   const score = Math.round((reel.segment.score ?? reel.segment.hook_score) * 100);
   const duration = Math.round(reel.segment.end - reel.segment.start);
   const title = reel.title?.trim() || `Clip ${index + 1}`;
@@ -50,6 +51,7 @@ export function ReelCard({ reel, index }: { reel: ReelArtifact; index: number })
       {/* Title + summary + why selected */}
       <div>
         <h3 className="text-sm font-semibold leading-snug text-white">{title}</h3>
+        {jobId ? <ClipFeedback jobId={jobId} clipIndex={index} /> : null}
         {reel.segment.summary && (
           <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-white/60">{reel.segment.summary}</p>
         )}

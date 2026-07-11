@@ -94,7 +94,7 @@ export default function JobPage() {
       {job.artifacts.length > 0 && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {job.artifacts.map((reel, i) => (
-            <ReelCard key={i} reel={reel} index={i} />
+            <ReelCard key={i} reel={reel} index={i} jobId={id} />
           ))}
         </div>
       )}

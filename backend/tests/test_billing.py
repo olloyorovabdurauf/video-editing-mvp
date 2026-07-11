@@ -72,8 +72,9 @@ def test_estimate_scales_with_target_count():
     a = billing.estimate_job_credits(target_count=1, use_ai_broll=False)
     b = billing.estimate_job_credits(target_count=3, use_ai_broll=False)
     assert b > a
-    # Roughly 3x (base + smart_crop costs per reel)
-    assert 2.5 * a <= b <= 3.5 * a
+    # Per-reel part scales 3x; the flat assumed-source-minutes hold does not.
+    flat = billing.PRICING_CREDITS["source_minute"] * 30
+    assert (b - flat) == 3 * (a - flat)
 
 
 def test_ai_broll_costs_more():

@@ -262,3 +262,26 @@ export async function getJob(id: string): Promise<JobResponse> {
   if (!r.ok) throw new Error(`getJob failed: ${r.status}`);
   return r.json();
 }
+
+// ---------------------------------------------------------------------------
+// Per-clip feedback (👍/👎 + reason) — quality-iteration signal.
+// ---------------------------------------------------------------------------
+
+export type FeedbackReason =
+  | "story_incomplete" | "weak_hook" | "wrong_crop" | "subtitle_issue"
+  | "wrong_language" | "not_viral" | "render_quality" | "other";
+
+export async function sendFeedback(
+  jobId: string,
+  clipIndex: number,
+  verdict: "up" | "down",
+  reason?: FeedbackReason,
+): Promise<void> {
+  if (DEMO) return;
+  const r = await fetch(`/api/v1/reels/${jobId}/feedback`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(await authHeaders()) },
+    body: JSON.stringify({ clip_index: clipIndex, verdict, reason: reason ?? null }),
+  });
+  if (!r.ok) throw new ApiError(r.status, `Feedback failed (${r.status})`);
+}

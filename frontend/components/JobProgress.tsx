@@ -27,6 +27,12 @@ export function JobProgress({ job }: { job: JobResponse }) {
 
   return (
     <div className="card">
+      {!failed && !succeeded && (
+        <p className="mb-3 text-xs text-white/40">
+          Estimated time: about 2-4 minutes for most videos (longer podcasts take a bit more).
+          Your first clip usually appears before the job finishes.
+        </p>
+      )}
       <div className="mb-5 flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           {!succeeded && !failed && (

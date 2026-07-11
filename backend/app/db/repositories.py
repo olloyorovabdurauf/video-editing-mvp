@@ -182,3 +182,22 @@ def refund(user_id: str, hold_id: str) -> int | None:
         _append(s, user_id=user_id, delta=abs(held), kind="refund",
                 ref=job_id, idem=f"refund:{job_id}")
         return _balance(s, user_id)
+
+
+def record_feedback(user_id: str, *, job_id: str, clip_index: int,
+                    verdict: str, reason: str | None) -> bool:
+    """Store per-clip thumbs feedback. Last write wins per (user, job, clip)."""
+    from app.db.models import ClipFeedback
+    with session_scope() as s:
+        if s is None:
+            return False
+        existing = (s.query(ClipFeedback)
+                    .filter_by(user_id=user_id, job_id=job_id, clip_index=clip_index)
+                    .one_or_none())
+        if existing:
+            existing.verdict = verdict
+            existing.reason = reason
+        else:
+            s.add(ClipFeedback(user_id=user_id, job_id=job_id,
+                               clip_index=clip_index, verdict=verdict, reason=reason))
+        return True

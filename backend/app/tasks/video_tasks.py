@@ -226,7 +226,7 @@ def t_download(self, job_id: str, payload: dict) -> dict:
         # Retry transient blocks (403/429/timeout); fail permanent ones (private,
         # age-restricted) immediately with the user-facing message.
         if e.retryable and self.request.retries < self.max_retries:
-            raise self.retry(exc=e, countdown=15)
+            raise self.retry(exc=e, countdown=15 * (2 ** self.request.retries))
         _update(job_id, status=ReelJobStatus.FAILED.value, message=e.user_message)
         raise
 
@@ -252,7 +252,7 @@ def t_transcribe(self, ctx: dict) -> dict:
             _update(ctx["job_id"], status=ReelJobStatus.FAILED.value, message=_AI_QUOTA_MSG)
             raise
         logger.exception("transcription failed")
-        raise self.retry(exc=e, countdown=10)
+        raise self.retry(exc=e, countdown=10 * (2 ** self.request.retries))
 
     # Persist transcript so re-runs of downstream stages don't re-pay OpenAI.
     tpath = Path(ctx["source_path"]).with_suffix(".transcript.json")
@@ -349,11 +349,19 @@ def t_render(self, ctx: dict) -> dict:
         from app.services import billing as _billing
         # Actual = base + smart_crop + per-broll generations actually paid for.
         n_ai = sum(len(v) for v in (ctx.get("ai_broll_by_segment") or {}).values())
+        # Duration-based: source minutes are the real cost driver (transcription
+        # bills per minute) — a 5-min clip and a 2-hour podcast no longer cost
+        # the user the same. Cap at 3x the hold so a stale estimate can't
+        # surprise-drain a wallet.
+        import math as _math
+        minutes = _math.ceil(float(ctx.get("audio_minutes") or 0.0))
         actual = (
             _billing.PRICING_CREDITS["reel_base"] * len(artifacts)
             + (_billing.PRICING_CREDITS["smart_crop"] * len(artifacts) if req.smart_crop else 0)
             + _billing.PRICING_CREDITS["ai_broll_gen"] * n_ai
+            + _billing.PRICING_CREDITS["source_minute"] * minutes
         )
+        actual = min(actual, 3 * int(job_state.get("credits_held") or actual))
         _billing.settle(
             job_state["user_id"], job_state["credit_hold_id"],
             actual_amount=actual,
