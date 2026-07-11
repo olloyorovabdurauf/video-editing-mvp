@@ -277,11 +277,35 @@ def t_transcribe(self, ctx: dict) -> dict:
         from app.services import language_guard
         detected = _run(language_guard.detect_text_language(transcript.text))
         if detected and detected != transcript.language:
-            logger.warning("language guard: ASR labeled '{}' but text is '{}' — "
-                           "translating captions/metadata to '{}'",
-                           transcript.language, detected, detected)
             source_language = detected
             translate_to = detected
+            # NATIVE UPGRADE: when we have a native ASR for the real language
+            # (e.g. Uzbek via Google STT), RE-TRANSCRIBE instead of translating
+            # the mislabeled text — auto-detect then equals explicit selection:
+            # exact spoken words, native script, true word timing.
+            settings_ = transcription.get_settings()
+            if (detected in getattr(settings_, "google_stt_language_set", frozenset())
+                    and settings_.google_stt_credentials):
+                try:
+                    from app.services import google_stt
+                    logger.info("language guard: '{}' mislabeled as '{}' — native re-transcribe",
+                                detected, transcript.language)
+                    transcript = _run(google_stt.transcribe(
+                        Path(ctx["source_path"]), language=detected))
+                    tpath.write_text(json.dumps({
+                        "language": transcript.language,
+                        "text": transcript.text,
+                        "words": [w.__dict__ for w in transcript.words],
+                    }), encoding="utf-8")
+                    audio_minutes = round((transcript.words[-1].end / 60.0)
+                                          if transcript.words else 0.0, 2)
+                    translate_to = None        # native — nothing to translate
+                except Exception as e:
+                    logger.warning("native re-transcribe failed ({}) — using translate path", e)
+            if translate_to:
+                logger.warning("language guard: ASR labeled '{}' but text is '{}' — "
+                               "translating captions/metadata to '{}'",
+                               transcript.language, detected, detected)
     return {**ctx, "transcript_path": str(tpath), "audio_minutes": audio_minutes,
             "source_language": source_language, "translate_to": translate_to}
 
@@ -298,12 +322,20 @@ def t_analyze(self, ctx: dict) -> dict:
         words=[transcription.Word(**w) for w in raw["words"]],
     )
 
+    energy = None
+    try:
+        from app.services import audio_energy
+        energy = audio_energy.energy_curve(Path(ctx["source_path"]))
+    except Exception as e:                     # signal is optional, never fatal
+        logger.warning("energy curve failed (ranking without it): {}", e)
+
     segments = _run(segment_picker.pick_segments(
         transcript,
         n=req.target_count,
         min_duration_s=req.min_duration_s,
         max_duration_s=req.max_duration_s,
         prompt=req.prompt,
+        energy=energy,
     ))
     return {**ctx, "segments": [s.model_dump() for s in segments]}
 

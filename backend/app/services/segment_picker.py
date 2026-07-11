@@ -175,6 +175,7 @@ async def pick_segments(
     min_duration_s: int,
     max_duration_s: int,
     prompt: str | None,
+    energy: list[float] | None = None,
 ) -> list[Segment]:
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -188,7 +189,7 @@ async def pick_segments(
 
     # v4: invalidates clips cached before the hierarchical rubric (new score
     # dimensions + standalone gate change which clips win).
-    ck = ai_cache.key("segpick_v9", compressed, n, min_eff, max_duration_s, prompt or "")
+    ck = ai_cache.key("segpick_v10", compressed, n, min_eff, max_duration_s, prompt or "")
     cached = ai_cache.get_json(ck)
     if cached is not None:
         logger.info("segment picks cache hit")
@@ -197,14 +198,15 @@ async def pick_segments(
     value_end = max(min_eff, max_duration_s - 15)
     # THE COUNT IS A CONTRACT: generate a 3x candidate surplus so reviewer
     # rejections and dedupe always have replacements to draw from.
-    cand_n = min(15, max(3 * n, 9))
+    cand_n = min(24, max(4 * n, 12))
+    story_blocks: list[float] = []          # story_map openings, shared across passes
 
     async def _ask(model: str, system: str, temperature: float, min_completeness: float) -> list[Segment]:
         resp = await client.chat.completions.create(
             model=model,
             response_format={"type": "json_object"},
             temperature=temperature,
-            max_tokens=2600,               # room for the story_map + richer scores
+            max_tokens=3200,               # room for the story_map + richer scores
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": USER_TEMPLATE.format(
@@ -212,7 +214,9 @@ async def pick_segments(
                     min_dur=min_eff, max_dur=max_duration_s)},
             ],
         )
-        picks = _clamp(_safe_segments(resp), transcript, min_eff, max_duration_s)
+        story_blocks.extend(b for b in _safe_block_starts(resp) if b not in story_blocks)
+        picks = _clamp(_safe_segments(resp), transcript, min_eff, max_duration_s,
+                       block_starts=story_blocks)
         # Two gates: a complete arc AND it stands alone with zero external context
         # (Issue 4). Both track the pass's bar so the fill pass can relax together.
         picks = [p for p in picks
@@ -248,6 +252,11 @@ async def pick_segments(
     if len(pool) < n:
         logger.info("AI gave {}/{} candidates → distributing across the timeline", len(pool), n)
         pool = _dedupe_overlap(_distribute_clips(transcript, pool, n, min_eff, max_duration_s))
+    if energy:
+        # Viral Intelligence: vocal-delivery signal — emphatic windows (and
+        # ones whose energy peaks at the landing) outrank monotone ones.
+        from app.services import audio_energy
+        pool = audio_energy.rerank(pool, energy)
     pool.sort(key=lambda x: x.score, reverse=True)
 
     if not pool:
@@ -439,6 +448,17 @@ def _safe_segments(resp: Any) -> list[dict]:
         return []
 
 
+def _safe_block_starts(resp: Any) -> list[float]:
+    """Story-block opening times from the model's story_map — where each story
+    ACTUALLY begins (hook + teaser included). Used to protect openings."""
+    content = (resp.choices[0].message.content or "").strip()
+    try:
+        blocks = json.loads(content).get("story_map", [])
+        return sorted({float(b["start"]) for b in blocks if isinstance(b, dict) and "start" in b})
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        return []
+
+
 def _f(v: Any, default: float = 0.5) -> float:
     try:
         return max(0.0, min(1.0, float(v)))
@@ -490,8 +510,14 @@ _HARD_MAX_FRACTION = 1.5      # e.g. max 60 → never above 90s
 _PLATFORM_CAP_S = 90.0
 
 
+# A pick starting within this window AFTER a story block's opening is snapped
+# BACK to the block start — the hook/teaser/open-loop belongs to the clip.
+_TEASER_RECOVERY_S = 12.0
+
+
 def _finalize_window(words: list[Word], start: float, end: float,
-                     min_s: float, max_s: float) -> tuple[float, float] | None:
+                     min_s: float, max_s: float,
+                     block_starts: list[float] | tuple = ()) -> tuple[float, float] | None:
     """
     Align [start, end] to where the IDEA begins and naturally finishes.
 
@@ -512,6 +538,11 @@ def _finalize_window(words: list[Word], start: float, end: float,
     hard_max = min(_PLATFORM_CAP_S, _HARD_MAX_FRACTION * max_s)
 
     start = max(t0, min(start, t1))
+    # TEASER PRESERVATION: if the pick begins just AFTER a story block opens,
+    # the hook/teaser was cut — pull the start back to the block's opening.
+    behind = [b for b in block_starts if start - _TEASER_RECOVERY_S <= b <= start + 0.4]
+    if behind:
+        start = max(t0, min(start, max(behind)))
     sent_starts, sent_ends = _boundaries(words)
     word_starts = [w.start for w in words]
     word_ends = [w.end for w in words]
@@ -563,7 +594,8 @@ def _text_in_window(transcript: Transcript, start: float, end: float) -> str:
     return " ".join(w.text for w in transcript.words if start <= w.start <= end)[:1500]
 
 
-def _clamp(raw: list, transcript: Transcript, min_s: int, max_s: int) -> list[Segment]:
+def _clamp(raw: list, transcript: Transcript, min_s: int, max_s: int,
+           block_starts: list[float] | tuple = ()) -> list[Segment]:
     """Validate raw picks into complete, boundary-aligned, duration-correct clips."""
     words = transcript.words
     out: list[Segment] = []
@@ -574,7 +606,8 @@ def _clamp(raw: list, transcript: Transcript, min_s: int, max_s: int) -> list[Se
             start = float(s["start"]); end = float(s["end"])
         except (KeyError, ValueError, TypeError):
             continue
-        win = _finalize_window(words, start, end, float(min_s), float(max_s))
+        win = _finalize_window(words, start, end, float(min_s), float(max_s),
+                               block_starts=block_starts)
         if win is None:
             continue
         ws, we = win
